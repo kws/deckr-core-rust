@@ -15,7 +15,7 @@ pub const HARDWARE_CLAIM_PROFILE_ID: &str = "dev.deckr.profile.hardware_claim.v1
 pub const HARDWARE_FEATURE_ID: &str = "dev.deckr.hardware";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileCapacity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_instances: Option<u64>,
@@ -39,7 +39,7 @@ impl ProfileCapacity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareAdvertisementDevice {
     #[serde(default)]
     pub capacity: ProfileCapacity,
@@ -47,8 +47,32 @@ pub struct HardwareAdvertisementDevice {
     pub descriptor: DeviceDescriptor,
 }
 
+impl HardwareAdvertisementDevice {
+    pub fn validate(&self) -> Result<()> {
+        self.capacity.validate()?;
+        self.device_ref.validate()?;
+        self.descriptor.validate()?;
+        if self.descriptor.device_id != self.device_ref.device_id {
+            return Err(Error::Invalid(
+                "descriptor.deviceId must match deviceRef.deviceId".into(),
+            ));
+        }
+        if self
+            .device_ref
+            .fingerprint
+            .as_ref()
+            .is_some_and(|fingerprint| fingerprint != &self.descriptor.fingerprint)
+        {
+            return Err(Error::Invalid(
+                "deviceRef fingerprint must match descriptor fingerprint".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareBeaconPayload {
     #[serde(default = "hardware_profile_id")]
     pub profile: String,
@@ -87,9 +111,7 @@ impl HardwareBeaconPayload {
             ));
         }
         for (key, device) in &self.devices {
-            device.capacity.validate()?;
-            device.device_ref.validate()?;
-            device.descriptor.validate()?;
+            device.validate()?;
             if device.device_ref.manager_id != self.manager_id {
                 return Err(Error::Invalid(
                     "deviceRef.managerId must match managerId".to_string(),
@@ -100,35 +122,32 @@ impl HardwareBeaconPayload {
                     "device map keys must match deviceRef.deviceId".to_string(),
                 ));
             }
-            if device.descriptor.device_id != device.device_ref.device_id {
-                return Err(Error::Invalid(
-                    "descriptor.deviceId must match deviceRef.deviceId".to_string(),
-                ));
-            }
-            if device
-                .device_ref
-                .fingerprint
-                .as_ref()
-                .is_some_and(|fingerprint| fingerprint != &device.descriptor.fingerprint)
-            {
-                return Err(Error::Invalid(
-                    "deviceRef fingerprint must match descriptor fingerprint".to_string(),
-                ));
-            }
         }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareClaimDevice {
     pub device_ref: DeviceRef,
     pub instance_count: u64,
 }
 
+impl HardwareClaimDevice {
+    pub fn validate(&self) -> Result<()> {
+        self.device_ref.validate()?;
+        if self.instance_count == 0 {
+            return Err(Error::Invalid(
+                "instanceCount must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HardwareClaimTerms {
     #[serde(default = "hardware_claim_profile_id")]
     pub profile: String,
@@ -174,11 +193,7 @@ impl HardwareClaimTerms {
         }
         let mut device_ids = BTreeSet::new();
         for device in &self.devices {
-            if device.instance_count == 0 {
-                return Err(Error::Invalid(
-                    "instanceCount must be greater than zero".to_string(),
-                ));
-            }
+            device.validate()?;
             if device.device_ref.manager_id != self.manager_endpoint.endpoint_id() {
                 return Err(Error::Invalid(
                     "deviceRef.managerId must match managerEndpoint".to_string(),

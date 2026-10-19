@@ -5,7 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::SecondsFormat;
 use futures_util::future::{select, Either};
 use futures_util::{pin_mut, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,19 @@ use crate::state::{
     StateStore, StateStorePolicy, StateWatchStream,
 };
 use crate::{Error, Result};
+
+mod evaluator;
+mod view;
+pub use view::ConcordViewStats;
+mod maintenance;
+mod managed;
+use evaluator::evaluate_observations;
+pub use evaluator::{evaluate_contract, ContractObservations, ValidityReason};
+pub use maintenance::*;
+pub use managed::{
+    AgreementContext, AgreementIntent, AgreementState, ManagedParticipant, ManagedProposal,
+    ParticipantCandidates, ParticipantPolicy, ParticipantState,
+};
 
 pub const CONCORD_CONTRACT_SCHEMA_ID: &str = "dev.deckr.concord.contract.v1";
 pub const CONCORD_PARTICIPANT_TOKEN_SCHEMA_ID: &str = "dev.deckr.concord.participant-token.v1";
@@ -76,7 +89,7 @@ pub enum ContractValidityStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TokenObservation {
     pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,7 +101,7 @@ pub struct TokenObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContractRecord {
     #[serde(default = "contract_schema_id", rename = "schema")]
     pub schema_id: String,
@@ -206,6 +219,10 @@ impl ContractRecord {
                 }
             }
         }
+        for timestamp in [&self.created_at, &self.cancelled_at].into_iter().flatten() {
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .map_err(|_| Error::Invalid("Concord timestamp must be RFC 3339".into()))?;
+        }
         if let Some(supersedes) = &self.supersedes {
             supersedes.validate()?;
         }
@@ -214,7 +231,7 @@ impl ContractRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ParticipantTokenRecord {
     #[serde(default = "participant_token_schema_id", rename = "schema")]
     pub schema_id: String,
@@ -276,7 +293,8 @@ impl ParticipantTokenRecord {
         if let Some(contract_hash) = &self.contract_hash {
             require_text(contract_hash, "Concord participant token field")?;
         }
-        for observation in self.observed.values() {
+        for (participant, observation) in &self.observed {
+            EndpointAddress::parse_protocol(participant)?;
             if observation.generation == 0 {
                 return Err(Error::Invalid(
                     "token observation generation must be greater than zero".to_string(),
@@ -320,6 +338,9 @@ pub struct ContractValidity {
     pub contract: Option<ContractRecord>,
     pub tokens: BTreeMap<String, ParticipantTokenRecord>,
     pub reason: Option<String>,
+    /// Machine-readable outcome. Diagnostic text is never a policy input.
+    pub reason_code: Option<ValidityReason>,
+    pub participant: Option<EndpointAddress>,
 }
 
 impl ContractValidity {
@@ -359,6 +380,7 @@ impl CreateContractSpec {
 pub struct ContractFilters<'a> {
     pub profile: Option<&'a str>,
     pub contract_id: Option<&'a str>,
+    pub pointer: Option<&'a ContractPointer>,
     pub participant: Option<&'a EndpointAddress>,
     pub state: Option<ContractState>,
 }
@@ -417,6 +439,15 @@ pub struct ConcordContractNotification {
 }
 
 pub struct ConcordContractNotificationStream {
+    inner: NotificationStream,
+}
+
+enum NotificationStream {
+    Exact(ExactNotifications),
+    Cached(view::NotificationAdapter),
+}
+
+struct ExactNotifications {
     contracts: StateWatchStream,
     tokens: StateWatchStream,
     known_profiles: BTreeMap<(String, u64), Option<String>>,
@@ -426,6 +457,15 @@ pub struct ConcordContractNotificationStream {
 
 impl ConcordContractNotificationStream {
     pub async fn next(&mut self) -> Result<ConcordContractNotification> {
+        match &mut self.inner {
+            NotificationStream::Exact(stream) => stream.next().await,
+            NotificationStream::Cached(stream) => stream.next().await,
+        }
+    }
+}
+
+impl ExactNotifications {
+    async fn next(&mut self) -> Result<ConcordContractNotification> {
         loop {
             let contracts = self.contracts.next();
             let tokens = self.tokens.next();
@@ -544,7 +584,13 @@ impl ConcordParticipantLease {
         concord.withdraw(&token).await
     }
 
+    /// Update observations for an already held identity. This is not a local
+    /// renewal and cannot extend its deadline or restore an expired lease.
     pub fn adopt(&mut self, token: ParticipantHandle) -> Result<()> {
+        if self.token.is_some() && self.token().is_none() {
+            self.close();
+            return Err(Error::Unauthorized("Concord local lease has ended".into()));
+        }
         let Some(current) = self.token.as_ref() else {
             return Err(Error::Invalid(
                 "participant token cannot be adopted without an existing local handle".to_string(),
@@ -575,13 +621,17 @@ impl ConcordParticipantLease {
                 "participant token does not match local handle".to_string(),
             ));
         }
+        if token.ttl_seconds != current.ttl_seconds {
+            return Err(Error::Invalid(
+                "observed participant token TTL differs from the held lease".into(),
+            ));
+        }
         if self.token.as_ref() == Some(&token) {
             return Ok(());
         }
         self.refresh_interval =
             ttl_heartbeat_delay(Some(self.requested_refresh_interval), token.ttl_seconds);
         self.token = Some(token);
-        self.last_token_refresh_at = Some(Instant::now());
         Ok(())
     }
 
@@ -728,6 +778,8 @@ impl ConcordParticipantLease {
 pub struct ConcordCoordinator<C: StateStore, T: StateStore> {
     contract_state: C,
     token_state: T,
+    clock: Arc<dyn crate::lifecycle::Clock>,
+    view: Arc<std::sync::Mutex<Option<Arc<view::SharedView>>>>,
 }
 
 impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
@@ -741,7 +793,18 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         Self {
             contract_state,
             token_state,
+            clock: Arc::new(crate::lifecycle::SystemClock),
+            view: Arc::default(),
         }
+    }
+
+    pub fn clock(mut self, clock: Arc<dyn crate::lifecycle::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn runtime_clock(&self) -> Arc<dyn crate::lifecycle::Clock> {
+        self.clock.clone()
     }
 
     pub fn token_state(&self) -> &T {
@@ -751,11 +814,13 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
     async fn token_ttl_seconds(&self) -> Result<u64> {
         match self.token_state.ttl_seconds().await? {
             Some(ttl_seconds) if ttl_seconds > 0 => Ok(ttl_seconds),
-            Some(_) => Err(Error::StateUnavailable(
-                "Concord participant token bucket TTL must be greater than zero".to_string(),
+            Some(_) => Err(Error::mutation(
+                crate::MutationCode::TtlInvalid,
+                "Concord participant token bucket TTL must be greater than zero",
             )),
-            None => Err(Error::StateUnavailable(
-                "Concord participant token bucket must be TTL-bound".to_string(),
+            None => Err(Error::mutation(
+                crate::MutationCode::TtlMetadataMissing,
+                "Concord participant token bucket must be TTL-bound",
             )),
         }
     }
@@ -766,45 +831,21 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         participant: Option<&EndpointAddress>,
     ) -> Result<ConcordContractNotificationStream> {
         Ok(ConcordContractNotificationStream {
-            contracts: self
-                .contract_state
-                .watch(concord_contracts_prefix())
-                .await?,
-            tokens: self.token_state.watch(concord_contracts_prefix()).await?,
-            known_profiles: BTreeMap::new(),
-            profile_filter: profile.map(ToString::to_string),
-            participant_filter: participant.cloned(),
+            inner: NotificationStream::Exact(ExactNotifications {
+                contracts: self
+                    .contract_state
+                    .watch(concord_contracts_prefix())
+                    .await?,
+                tokens: self.token_state.watch(concord_contracts_prefix()).await?,
+                known_profiles: BTreeMap::new(),
+                profile_filter: profile.map(ToString::to_string),
+                participant_filter: participant.cloned(),
+            }),
         })
     }
 
-    pub async fn create_contract(&self, mut spec: CreateContractSpec) -> Result<ContractHandle> {
-        spec.participants.sort();
-        let terms_hash = spec
-            .terms
-            .as_ref()
-            .map(canonical_json_hash_value)
-            .transpose()?;
-        let record = ContractRecord {
-            schema_id: CONCORD_CONTRACT_SCHEMA_ID.to_string(),
-            contract_id: spec
-                .contract_id
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            generation: spec.generation,
-            participants: spec.participants,
-            attached_participants: Vec::new(),
-            state: ContractState::Open,
-            profile: spec.profile,
-            terms_hash,
-            terms: spec.terms,
-            created_by: spec.created_by,
-            participant_sessions: spec.participant_sessions,
-            created_at: Some(now()),
-            cancelled_by: None,
-            cancelled_at: None,
-            cancel_revision: None,
-            cancel_reason: None,
-            supersedes: spec.supersedes,
-        };
+    pub async fn create_contract(&self, spec: CreateContractSpec) -> Result<ContractHandle> {
+        let record = proposal_record(spec, self.clock.as_ref())?;
         let key = make_concord_contract_key(&record.contract_id, record.generation);
         let entry = self
             .contract_state
@@ -834,6 +875,11 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
                 .profile
                 .is_some_and(|profile| record.profile.as_deref() != Some(profile))
             {
+                continue;
+            }
+            if filters.pointer.is_some_and(|pointer| {
+                record.contract_id != pointer.contract_id || record.generation != pointer.generation
+            }) {
                 continue;
             }
             if filters
@@ -894,18 +940,41 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         session_id: &str,
         token_id: Option<String>,
     ) -> Result<ParticipantHandle> {
+        self.attach_attempts(contract, participant, session_id, token_id, 8)
+            .await
+    }
+
+    async fn attach_once(
+        &self,
+        contract: &ContractHandle,
+        participant: &EndpointAddress,
+        session_id: &str,
+        token_id: String,
+    ) -> Result<ParticipantHandle> {
+        self.attach_attempts(contract, participant, session_id, Some(token_id), 1)
+            .await
+    }
+
+    async fn attach_attempts(
+        &self,
+        contract: &ContractHandle,
+        participant: &EndpointAddress,
+        session_id: &str,
+        token_id: Option<String>,
+        attempts: usize,
+    ) -> Result<ParticipantHandle> {
         let Some(current) = self.contract_state.get(&contract.key).await? else {
-            return Err(Error::StateConflict(format!(
-                "Concord contract {:?} is missing",
-                contract.key
-            )));
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                format!("Concord contract {:?} is missing", contract.key),
+            ));
         };
-        let record = ContractRecord::from_value(current.value)?;
+        let record = checked_contract(current, contract)?;
         if record.state == ContractState::Cancelled {
-            return Err(Error::StateConflict(format!(
-                "Concord contract {:?} is cancelled",
-                contract.key
-            )));
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                format!("Concord contract {:?} is cancelled", contract.key),
+            ));
         }
         if !record.participants.contains(participant) {
             return Err(Error::Invalid(
@@ -914,8 +983,9 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         }
         if let Some(expected_session) = record.participant_sessions.get(participant.as_str()) {
             if expected_session != session_id {
-                return Err(Error::StateConflict(
-                    "participant session does not match the contract session fence".to_string(),
+                return Err(Error::mutation(
+                    crate::MutationCode::TokenIdentityMismatch,
+                    "participant session does not match the contract session fence",
                 ));
             }
         }
@@ -924,7 +994,10 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         let requested_token_id = token_id.clone();
         if record.attached_participants.contains(participant) {
             if let Some(entry) = self.token_state.get(&token_key).await? {
-                let existing = ParticipantTokenRecord::from_value(entry.value.clone())?;
+                let existing =
+                    ParticipantTokenRecord::from_value(entry.value.clone()).map_err(|error| {
+                        Error::mutation(crate::MutationCode::TokenInvalid, error.to_string())
+                    })?;
                 if token_matches_attach_request(
                     &existing,
                     &record,
@@ -935,8 +1008,9 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
                     return Ok(participant_handle(token_key, &existing, entry.revision));
                 }
             }
-            return Err(Error::StateConflict(
-                "Concord participant is already attached".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenIdentityMismatch,
+                "Concord participant is already attached",
             ));
         }
         let ttl_seconds = self.token_ttl_seconds().await?;
@@ -959,13 +1033,17 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
             .await
         {
             Ok(entry) => (token, entry),
-            Err(Error::StateConflict(_)) => {
+            Err(error) if error.is_state_conflict() => {
                 let Some(entry) = self.token_state.get(&token_key).await? else {
-                    return Err(Error::StateConflict(
-                        "Concord participant token changed during attach".to_string(),
+                    return Err(Error::mutation(
+                        crate::MutationCode::TokenIdentityMismatch,
+                        "Concord participant token changed during attach",
                     ));
                 };
-                let existing = ParticipantTokenRecord::from_value(entry.value.clone())?;
+                let existing =
+                    ParticipantTokenRecord::from_value(entry.value.clone()).map_err(|error| {
+                        Error::mutation(crate::MutationCode::TokenInvalid, error.to_string())
+                    })?;
                 if !token_matches_attach_request(
                     &existing,
                     &record,
@@ -973,8 +1051,9 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
                     session_id,
                     requested_token_id.as_deref(),
                 ) {
-                    return Err(Error::StateConflict(
-                        "Concord participant token already exists".to_string(),
+                    return Err(Error::mutation(
+                        crate::MutationCode::KeyAlreadyExists,
+                        "Concord participant token already exists",
                     ));
                 }
                 (existing, entry)
@@ -982,31 +1061,36 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
             Err(error) => return Err(error),
         };
 
-        self.mark_participant_attached(&contract.key, participant)
+        self.mark_participant_attached(contract, participant, attempts)
             .await?;
         Ok(participant_handle(token_key, &token, token_entry.revision))
     }
 
     async fn mark_participant_attached(
         &self,
-        contract_key: &str,
+        contract: &ContractHandle,
         participant: &EndpointAddress,
+        attempts: usize,
     ) -> Result<()> {
-        loop {
+        let contract_key = &contract.key;
+        for attempt in 0..attempts {
             let Some(current) = self.contract_state.get(contract_key).await? else {
-                return Err(Error::StateConflict(format!(
-                    "Concord contract {contract_key:?} is missing"
-                )));
+                return Err(Error::mutation(
+                    crate::MutationCode::ContractInvalid,
+                    format!("Concord contract {contract_key:?} is missing"),
+                ));
             };
-            let mut record = ContractRecord::from_value(current.value)?;
+            let mut record = checked_contract(current.clone(), contract)?;
             if record.state == ContractState::Cancelled {
-                return Err(Error::StateConflict(format!(
-                    "Concord contract {contract_key:?} is cancelled"
-                )));
+                return Err(Error::mutation(
+                    crate::MutationCode::ContractInvalid,
+                    format!("Concord contract {contract_key:?} is cancelled"),
+                ));
             }
             if !record.participants.contains(participant) {
-                return Err(Error::StateConflict(
-                    "participant is not named by the Concord contract".to_string(),
+                return Err(Error::mutation(
+                    crate::MutationCode::ContractIdentityMismatch,
+                    "participant is not named by the Concord contract",
                 ));
             }
             if record.attached_participants.contains(participant) {
@@ -1021,38 +1105,72 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(Error::StateConflict(_)) => continue,
+                Err(error) if is_state_revision_conflict(&error) && attempt + 1 < attempts => {
+                    continue
+                }
                 Err(error) => return Err(error),
             }
         }
+        Err(Error::mutation(
+            crate::MutationCode::RevisionChanged,
+            "attachment retry limit reached",
+        ))
     }
 
     pub async fn refresh(&self, handle: &ParticipantHandle) -> Result<ParticipantHandle> {
         let contract_key = make_concord_contract_key(&handle.contract_id, handle.generation);
         let Some(contract_entry) = self.contract_state.get(&contract_key).await? else {
-            return Err(Error::StateConflict(
-                "Concord contract is missing".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                "Concord contract is missing",
             ));
         };
-        let contract = ContractRecord::from_value(contract_entry.value)?;
+        let contract = ContractRecord::from_value(contract_entry.value).map_err(|error| {
+            Error::mutation(crate::MutationCode::ContractInvalid, error.to_string())
+        })?;
+        if contract_entry.key
+            != make_concord_contract_key(&contract.contract_id, contract.generation)
+            || contract.contract_id != handle.contract_id
+            || contract.generation != handle.generation
+            || !contract.participants.contains(&handle.participant)
+            || !contract.attached_participants.contains(&handle.participant)
+            || contract.terms_hash != handle.terms_hash
+            || contract
+                .participant_sessions
+                .get(handle.participant.as_str())
+                .is_some_and(|session| session != &handle.session_id)
+        {
+            return Err(Error::mutation(
+                crate::MutationCode::ContractIdentityMismatch,
+                "Concord contract identity changed",
+            ));
+        }
         if contract.state == ContractState::Cancelled {
-            return Err(Error::StateConflict(
-                "Concord contract is cancelled".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                "Concord contract is cancelled",
             ));
         }
         let Some(token_entry) = self.token_state.get(&handle.key).await? else {
-            return Err(Error::StateConflict(
-                "Concord participant token is missing".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenInvalid,
+                "Concord participant token is missing",
             ));
         };
-        let mut token = ParticipantTokenRecord::from_value(token_entry.value)?;
+        let mut token = checked_token(&token_entry, handle)?;
         if !token_matches_handle(&token, handle) {
-            return Err(Error::StateConflict(
-                "Concord participant token changed owner".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenIdentityMismatch,
+                "Concord participant token changed owner",
             ));
         }
         token.ttl_seconds = self.token_ttl_seconds().await?;
-        token.refresh_seq += 1;
+        token.refresh_seq = token.refresh_seq.checked_add(1).ok_or_else(|| {
+            Error::mutation(
+                crate::MutationCode::TokenInvalid,
+                "token refresh sequence exhausted",
+            )
+        })?;
         let entry = match self
             .token_state
             .update(
@@ -1066,14 +1184,16 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
             Ok(entry) => entry,
             Err(error) if is_state_revision_conflict(&error) => {
                 let Some(latest_entry) = self.token_state.get(&handle.key).await? else {
-                    return Err(Error::StateConflict(
-                        "Concord participant token is missing".to_string(),
+                    return Err(Error::mutation(
+                        crate::MutationCode::TokenInvalid,
+                        "Concord participant token is missing",
                     ));
                 };
-                let latest = ParticipantTokenRecord::from_value(latest_entry.value)?;
+                let latest = checked_token(&latest_entry, handle)?;
                 if !token_matches_handle(&latest, handle) {
-                    return Err(Error::StateConflict(
-                        "Concord participant token changed owner".to_string(),
+                    return Err(Error::mutation(
+                        crate::MutationCode::TokenIdentityMismatch,
+                        "Concord participant token changed owner",
                     ));
                 }
                 return Ok(participant_handle(
@@ -1097,25 +1217,48 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
     ) -> Result<ParticipantHandle> {
         let contract_key = make_concord_contract_key(&handle.contract_id, handle.generation);
         let Some(contract_entry) = self.contract_state.get(&contract_key).await? else {
-            return Err(Error::StateConflict(
-                "Concord contract is missing".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                "Concord contract is missing",
             ));
         };
-        let contract = ContractRecord::from_value(contract_entry.value)?;
+        let contract = ContractRecord::from_value(contract_entry.value).map_err(|error| {
+            Error::mutation(crate::MutationCode::ContractInvalid, error.to_string())
+        })?;
+        if contract_entry.key
+            != make_concord_contract_key(&contract.contract_id, contract.generation)
+            || contract.contract_id != handle.contract_id
+            || contract.generation != handle.generation
+            || !contract.participants.contains(&handle.participant)
+            || !contract.attached_participants.contains(&handle.participant)
+            || contract.terms_hash != handle.terms_hash
+            || contract
+                .participant_sessions
+                .get(handle.participant.as_str())
+                .is_some_and(|session| session != &handle.session_id)
+        {
+            return Err(Error::mutation(
+                crate::MutationCode::ContractIdentityMismatch,
+                "Concord contract identity changed",
+            ));
+        }
         if contract.state == ContractState::Cancelled {
-            return Err(Error::StateConflict(
-                "Concord contract is cancelled".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::ContractInvalid,
+                "Concord contract is cancelled",
             ));
         }
         let Some(token_entry) = self.token_state.get(&handle.key).await? else {
-            return Err(Error::StateConflict(
-                "Concord participant token is missing".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenInvalid,
+                "Concord participant token is missing",
             ));
         };
-        let token = ParticipantTokenRecord::from_value(token_entry.value)?;
+        let token = checked_token(&token_entry, handle)?;
         if !token_matches_handle(&token, handle) {
-            return Err(Error::StateConflict(
-                "Concord participant token changed owner".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenIdentityMismatch,
+                "Concord participant token changed owner",
             ));
         }
         Ok(participant_handle(
@@ -1129,10 +1272,11 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         let Some(token_entry) = self.token_state.get(&handle.key).await? else {
             return Ok(false);
         };
-        let token = ParticipantTokenRecord::from_value(token_entry.value)?;
+        let token = checked_token(&token_entry, handle)?;
         if !token_matches_handle(&token, handle) {
-            return Err(Error::StateConflict(
-                "Concord participant token changed owner".to_string(),
+            return Err(Error::mutation(
+                crate::MutationCode::TokenIdentityMismatch,
+                "Concord participant token changed owner",
             ));
         }
         self.token_state
@@ -1150,7 +1294,7 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         let Some(current) = self.contract_state.get(&contract.key).await? else {
             return Ok(false);
         };
-        let mut record = ContractRecord::from_value(current.value)?;
+        let mut record = checked_contract(current.clone(), contract)?;
         if record.state == ContractState::Cancelled {
             return Ok(false);
         }
@@ -1161,7 +1305,11 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         }
         record.state = ContractState::Cancelled;
         record.cancelled_by = Some(participant.clone());
-        record.cancelled_at = Some(now());
+        record.cancelled_at = Some(
+            self.clock
+                .utc_now()
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
         record.cancel_revision = Some(current.revision);
         record.cancel_reason = reason;
         self.contract_state
@@ -1177,7 +1325,7 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
     ) -> ContractValidity {
         let entry = match self.contract_state.get(&contract.key).await {
             Ok(entry) => entry,
-            Err(_) => return validity(ContractValidityStatus::Unavailable, None, None),
+            Err(_) => return unavailable(None),
         };
         let mut tokens = BTreeMap::new();
         if let Some(record) = entry
@@ -1195,9 +1343,7 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
                         tokens.insert(key, entry);
                     }
                     Ok(None) => {}
-                    Err(_) => {
-                        return validity(ContractValidityStatus::Unavailable, Some(record), None)
-                    }
+                    Err(_) => return unavailable(Some(record)),
                 }
             }
         }
@@ -1209,11 +1355,27 @@ impl<C: StateStore, T: StateStore>
     ConcordCoordinator<MaterializedStateStore<C>, MaterializedStateStore<T>>
 {
     pub fn close_sources(&self) {
+        if let Some(view) = self
+            .view
+            .lock()
+            .expect("Concord view initialization lock poisoned")
+            .as_ref()
+        {
+            view.close();
+        }
         self.contract_state.close();
         self.token_state.close();
     }
     pub async fn close_sources_and_wait(&self) {
         self.close_sources();
+        let view = self
+            .view
+            .lock()
+            .expect("Concord view initialization lock poisoned")
+            .clone();
+        if let Some(view) = view {
+            view.close_and_wait().await;
+        }
         self.contract_state.close_and_wait().await;
         self.token_state.close_and_wait().await;
     }
@@ -1221,153 +1383,10 @@ impl<C: StateStore, T: StateStore>
         self.contract_state.is_current() && self.token_state.is_current()
     }
 
-    /// Bounded current-state view; snapshots contain complete filtered membership.
+    /// Shared indexed view with atomic registration, full filtered membership,
+    /// bounded change detail, and preserved currentness interruptions.
     pub fn watch_state(&self, filters: ContractFilters<'_>) -> Result<ConcordStateWatch> {
-        let contracts = self
-            .contract_state
-            .watch_snapshots(concord_contracts_prefix())?;
-        let tokens = self
-            .token_state
-            .watch_snapshots(concord_contracts_prefix())?;
-        let profile = filters.profile.map(str::to_owned);
-        let participant = filters.participant.cloned();
-        let contract_id = filters.contract_id.map(str::to_owned);
-        let state = filters.state;
-        Ok(Box::pin(futures_util::stream::unfold(
-            (
-                contracts,
-                tokens,
-                None::<crate::state::StateSnapshot>,
-                None::<crate::state::StateSnapshot>,
-                0u64,
-                BTreeMap::<String, ConcordViewContract>::new(),
-            ),
-            move |(
-                mut contracts,
-                mut tokens,
-                mut contract_snapshot,
-                mut token_snapshot,
-                version,
-                previous,
-            )| {
-                let profile = profile.clone();
-                let participant = participant.clone();
-                let contract_id = contract_id.clone();
-                async move {
-                    if contract_snapshot.is_none() {
-                        contract_snapshot = contracts.next().await;
-                        token_snapshot = tokens.next().await;
-                    } else {
-                        if contract_snapshot.as_ref()?.closed || token_snapshot.as_ref()?.closed {
-                            return None;
-                        }
-                        let next_contract = contracts.next();
-                        let next_token = tokens.next();
-                        pin_mut!(next_contract);
-                        pin_mut!(next_token);
-                        match select(next_contract, next_token).await {
-                            Either::Left((next, _)) => contract_snapshot = next,
-                            Either::Right((next, _)) => token_snapshot = next,
-                        }
-                    }
-                    let cs = contract_snapshot.as_ref()?;
-                    let ts = token_snapshot.as_ref()?;
-                    let current = cs.current && ts.current;
-                    let token_entries = ts
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.key.clone(), entry.clone()))
-                        .collect();
-                    let mut members = BTreeMap::new();
-                    for entry in &cs.entries {
-                        let Some(handle) = contract_handle_from_entry(entry.clone()) else {
-                            continue;
-                        };
-                        if profile
-                            .as_ref()
-                            .is_some_and(|profile| handle.profile.as_ref() != Some(profile))
-                            || participant.as_ref().is_some_and(|participant| {
-                                !handle.participants.contains(participant)
-                            })
-                            || contract_id
-                                .as_ref()
-                                .is_some_and(|id| &handle.contract_id != id)
-                        {
-                            continue;
-                        }
-                        let validity = if current {
-                            evaluate_observations(
-                                &handle,
-                                Some(entry.clone()),
-                                &token_entries,
-                                None,
-                            )
-                        } else {
-                            validity(ContractValidityStatus::Unavailable, None, None)
-                        };
-                        if state.is_some_and(|state| {
-                            validity
-                                .contract
-                                .as_ref()
-                                .is_none_or(|record| record.state != state)
-                        }) {
-                            continue;
-                        }
-                        members.insert(
-                            handle.key.clone(),
-                            ConcordViewContract {
-                                contract: handle,
-                                validity,
-                            },
-                        );
-                    }
-                    let changed_keys: BTreeSet<_> = if version == 0 {
-                        BTreeSet::new()
-                    } else {
-                        previous
-                            .keys()
-                            .chain(members.keys())
-                            .filter(|key| previous.get(*key) != members.get(*key))
-                            .cloned()
-                            .collect()
-                    };
-                    let overflow = changed_keys.len() > 256
-                        || cs.resnapshot_required
-                        || ts.resnapshot_required;
-                    let changed = if overflow {
-                        Vec::new()
-                    } else {
-                        changed_keys
-                            .iter()
-                            .filter_map(|key| members.get(key).or_else(|| previous.get(key)))
-                            .map(|member| ContractPointer {
-                                contract_id: member.contract.contract_id.clone(),
-                                generation: member.contract.generation,
-                            })
-                            .collect()
-                    };
-                    let snapshot = ConcordSnapshot {
-                        version: version + 1,
-                        current,
-                        closed: cs.closed || ts.closed,
-                        contracts: members.values().cloned().collect(),
-                        changed,
-                        resnapshot_required: overflow,
-                    };
-                    Some((
-                        snapshot,
-                        (
-                            contracts,
-                            tokens,
-                            contract_snapshot,
-                            token_snapshot,
-                            version + 1,
-                            members,
-                        ),
-                    ))
-                }
-            },
-        )))
+        self.indexed_watch(filters)
     }
 
     pub async fn wait_current(&self) -> Result<()> {
@@ -1376,47 +1395,7 @@ impl<C: StateStore, T: StateStore>
     }
 
     pub fn contracts_cached(&self, filters: ContractFilters<'_>) -> Result<Vec<ContractHandle>> {
-        let prefix = if let Some(contract_id) = filters.contract_id {
-            format!("contracts.{}.", crate::keys::encode_key_token(contract_id))
-        } else {
-            concord_contracts_prefix().to_string()
-        };
-        let mut contracts = Vec::new();
-        for entry in self.contract_state.items_cached(&prefix)? {
-            let Some((contract_id, generation)) = parse_concord_contract_key(&entry.key) else {
-                continue;
-            };
-            let Ok(record) = ContractRecord::from_value(entry.value.clone()) else {
-                continue;
-            };
-            if record.contract_id != contract_id || record.generation != generation {
-                continue;
-            }
-            if filters
-                .profile
-                .is_some_and(|profile| record.profile.as_deref() != Some(profile))
-            {
-                continue;
-            }
-            if filters
-                .contract_id
-                .is_some_and(|filter_contract_id| record.contract_id != filter_contract_id)
-            {
-                continue;
-            }
-            if filters
-                .participant
-                .is_some_and(|participant| !record.participants.contains(participant))
-            {
-                continue;
-            }
-            if filters.state.is_some_and(|state| record.state != state) {
-                continue;
-            }
-            contracts.push(contract_handle(entry.key, &record, entry.revision));
-        }
-        contracts.sort_by(|left, right| left.key.cmp(&right.key));
-        Ok(contracts)
+        self.indexed_contracts(filters)
     }
 
     pub fn contract_record_cached(
@@ -1427,6 +1406,15 @@ impl<C: StateStore, T: StateStore>
             return Ok(None);
         };
         Ok(Some(ContractRecord::from_value(entry.value)?))
+    }
+
+    /// Profile boundaries sometimes distinguish an omitted field from a parsed
+    /// null. This remains a cached observation and grants no authority itself.
+    pub(crate) fn raw_contract_cached(
+        &self,
+        handle: &ContractHandle,
+    ) -> Result<Option<StateEntry>> {
+        self.contract_state.get_cached(&handle.key)
     }
 
     pub fn participant_token_cached(
@@ -1457,24 +1445,7 @@ impl<C: StateStore, T: StateStore>
         contract: &ContractHandle,
         current_sessions: Option<&BTreeMap<String, String>>,
     ) -> ContractValidity {
-        let contracts = self.contract_state.snapshot();
-        let tokens = self.token_state.snapshot();
-        if !contracts.current || !tokens.current {
-            return validity(ContractValidityStatus::Unavailable, None, None);
-        }
-        evaluate_observations(
-            contract,
-            contracts
-                .entries
-                .into_iter()
-                .find(|entry| entry.key == contract.key),
-            &tokens
-                .entries
-                .into_iter()
-                .map(|entry| (entry.key.clone(), entry))
-                .collect(),
-            current_sessions,
-        )
+        self.indexed_validity(contract, current_sessions)
     }
 
     pub async fn watch_contract_notifications_cached(
@@ -1483,26 +1454,10 @@ impl<C: StateStore, T: StateStore>
         participant: Option<&EndpointAddress>,
     ) -> Result<ConcordContractNotificationStream> {
         self.wait_current().await?;
-        let known_profiles = self
-            .contracts_cached(ContractFilters {
-                profile,
-                participant,
-                ..ContractFilters::default()
-            })?
-            .into_iter()
-            .map(|contract| {
-                (
-                    (contract.contract_id.clone(), contract.generation),
-                    contract.profile.clone(),
-                )
-            })
-            .collect();
-        Ok(ConcordContractNotificationStream {
-            contracts: self.contract_state.subscribe_cached(),
-            tokens: self.token_state.subscribe_cached(),
-            known_profiles,
-            profile_filter: profile.map(ToString::to_string),
-            participant_filter: participant.cloned(),
+        self.indexed_notifications(ContractFilters {
+            profile,
+            participant,
+            ..Default::default()
         })
     }
 }
@@ -1518,6 +1473,60 @@ pub struct ConcordParticipantManager<C: StateStore, T: StateStore> {
     leases: BTreeMap<String, ConcordParticipantLease>,
     contract_index: BTreeMap<String, ContractHandle>,
     terminated: BTreeSet<String>,
+}
+
+/// Remote cleanup for a participant whose local authority has already ended.
+/// Keeping this separate lets profile boundaries revoke authority under their
+/// state lock and do network cleanup after releasing that lock.
+pub struct ConcordTermination<C: StateStore, T: StateStore> {
+    concord: ConcordCoordinator<C, T>,
+    contract: ContractHandle,
+    participant: EndpointAddress,
+    token: Option<ParticipantHandle>,
+}
+
+impl<C: StateStore, T: StateStore> ConcordTermination<C, T> {
+    /// Withdraw a terminated local lease without cancelling the contract.
+    /// Cleanup remains bounded and survives cancellation of its caller.
+    pub async fn withdraw(self) -> Result<()> {
+        tokio::spawn(async move {
+            if let Some(token) = self.token {
+                tokio::time::timeout(Duration::from_secs(5), self.concord.withdraw(&token))
+                    .await
+                    .map_err(|_| {
+                        Error::Deadline("owned-token withdrawal exceeded deadline".into())
+                    })??;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| Error::StateUnavailable(format!("owned-token cleanup failed: {error}")))?
+    }
+
+    /// Attempt cancellation and withdrawal independently, with bounded cleanup
+    /// that survives cancellation of its caller.
+    pub async fn cleanup(self, reason: Option<String>) -> Result<()> {
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let cancel = self
+                    .concord
+                    .cancel(&self.contract, &self.participant, reason);
+                let withdraw = async {
+                    if let Some(token) = self.token {
+                        self.concord.withdraw(&token).await?;
+                    }
+                    Ok(())
+                };
+                let (cancelled, withdrawn) = futures_util::future::join(cancel, withdraw).await;
+                cancelled?;
+                withdrawn
+            })
+            .await
+            .map_err(|_| Error::StateUnavailable("Concord cleanup deadline exceeded".into()))?
+        })
+        .await
+        .map_err(|error| Error::StateUnavailable(format!("Concord cleanup failed: {error}")))?
+    }
 }
 
 impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
@@ -1566,14 +1575,6 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
             .collect()
     }
 
-    pub(crate) fn owned_contract_keys(&self) -> Vec<String> {
-        self.leases.keys().cloned().collect()
-    }
-
-    pub(crate) fn revoke_lost_authority(&mut self) {
-        self.prune_lost_authority();
-    }
-
     pub fn has_authority(&self, contract_key: &str) -> bool {
         self.managed
             .get(contract_key)
@@ -1584,32 +1585,29 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
                 .is_some_and(|lease| lease.is_live(&self.concord))
     }
 
-    fn terminate(&mut self, key: &str) {
+    /// Permanently revoke a held agreement without waiting for remote cleanup.
+    /// An unaccepted candidate has no local authority to terminate.
+    pub fn terminate_contract(&mut self, key: &str) -> Option<ConcordTermination<C, T>> {
         self.managed.remove(key);
         self.contract_index.remove(key);
-        if let Some(mut lease) = self.leases.remove(key) {
-            // An unaccepted candidate has no local authority to terminate.
-            // It may become eligible when the caller's selection policy changes.
-            self.terminated.insert(key.to_string());
-            let token = lease.token.clone();
-            lease.close();
-            let concord = self.concord.clone();
-            let participant = self.participant.clone();
+        let mut lease = self.leases.remove(key)?;
+        self.terminated.insert(key.to_string());
+        let token = lease.token.clone();
+        lease.close();
+        Some(ConcordTermination {
+            concord: self.concord.clone(),
+            contract: lease.contract,
+            participant: self.participant.clone(),
+            token,
+        })
+    }
+
+    fn terminate(&mut self, key: &str) {
+        if let Some(termination) = self.terminate_contract(key) {
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    let cancel = concord.cancel(
-                        &lease.contract,
-                        &participant,
-                        Some("local authority ended".into()),
-                    );
-                    let withdraw = async {
-                        if let Some(token) = token {
-                            let _ = concord.withdraw(&token).await;
-                        }
-                    };
-                    let _ = futures_util::future::join(cancel, withdraw).await;
-                })
-                .await;
+                let _ = termination
+                    .cleanup(Some("local authority ended".into()))
+                    .await;
             });
         }
     }
@@ -1916,7 +1914,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
         if terminal_managed_status(validity.status) {
             if defer_unmanaged_missing_token(
                 validity.status,
-                validity.reason.as_deref(),
+                validity.participant.as_ref(),
                 &self.participant,
                 lease.as_ref(),
             ) {
@@ -1973,7 +1971,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
 
         let token = match lease.attach_or_refresh(&self.concord).await {
             Ok(token) => token,
-            Err(Error::StateConflict(_)) => {
+            Err(error) if error.is_state_conflict() => {
                 let validity = self.concord.validate(&contract, Some(&sessions)).await;
                 let record = validity.contract.clone().unwrap_or(record);
                 if terminal_managed_status(validity.status) {
@@ -2052,7 +2050,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
             .await
         {
             Ok(_) => Ok(()),
-            Err(Error::StateConflict(_))
+            Err(Error::StateConflict(_) | Error::Mutation { .. })
             | Err(Error::StateUnavailable(_))
             | Err(Error::Invalid(_)) => Ok(()),
             Err(error) => Err(error),
@@ -2068,7 +2066,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
             .await
         {
             Ok(_) => Ok(()),
-            Err(Error::StateConflict(_))
+            Err(Error::StateConflict(_) | Error::Mutation { .. })
             | Err(Error::StateUnavailable(_))
             | Err(Error::Invalid(_)) => Ok(()),
             Err(error) => Err(error),
@@ -2362,7 +2360,7 @@ impl<C: StateStore, T: StateStore>
         if terminal_managed_status(validity.status) {
             if defer_unmanaged_missing_token(
                 validity.status,
-                validity.reason.as_deref(),
+                validity.participant.as_ref(),
                 &self.participant,
                 lease.as_ref(),
             ) {
@@ -2418,7 +2416,7 @@ impl<C: StateStore, T: StateStore>
 
         let token = match lease.attach_or_refresh(&self.concord).await {
             Ok(token) => token,
-            Err(Error::StateConflict(_)) => {
+            Err(error) if error.is_state_conflict() => {
                 let validity = self.concord.validate_cached(&contract, Some(&sessions));
                 let record = validity.contract.clone().unwrap_or(record);
                 if terminal_managed_status(validity.status) {
@@ -2575,50 +2573,15 @@ fn contract_handle_from_entry(entry: StateEntry) -> Option<ContractHandle> {
     Some(contract_handle(entry.key.clone(), &record, entry.revision))
 }
 
-fn validity<T: Into<Option<String>>>(
-    status: ContractValidityStatus,
-    contract: Option<ContractRecord>,
-    reason: T,
-) -> ContractValidity {
+fn unavailable(contract: Option<ContractRecord>) -> ContractValidity {
     ContractValidity {
-        status,
+        status: ContractValidityStatus::Unavailable,
         contract,
         tokens: BTreeMap::new(),
-        reason: reason.into(),
+        reason: None,
+        reason_code: Some(ValidityReason::SourceUnavailable),
+        participant: None,
     }
-}
-
-fn token_validity_status(
-    token: &ParticipantTokenRecord,
-    contract: &ContractRecord,
-    participant: &EndpointAddress,
-    current_sessions: Option<&BTreeMap<String, String>>,
-) -> Option<ContractValidityStatus> {
-    if token.contract_id != contract.contract_id {
-        return Some(ContractValidityStatus::InvalidToken);
-    }
-    if token.generation != contract.generation {
-        return Some(ContractValidityStatus::GenerationMismatch);
-    }
-    if &token.participant != participant {
-        return Some(ContractValidityStatus::InvalidToken);
-    }
-    if contract.terms_hash.is_some() && token.terms_hash != contract.terms_hash {
-        return Some(ContractValidityStatus::TermsHashMismatch);
-    }
-    if let Some(frozen_session) = contract.participant_sessions.get(participant.as_str()) {
-        if &token.session_id != frozen_session {
-            return Some(ContractValidityStatus::SessionMismatch);
-        }
-    }
-    if let Some(current_sessions) = current_sessions {
-        if let Some(current_session) = current_sessions.get(participant.as_str()) {
-            if &token.session_id != current_session {
-                return Some(ContractValidityStatus::SessionMismatch);
-            }
-        }
-    }
-    None
 }
 
 fn token_matches_handle(token: &ParticipantTokenRecord, handle: &ParticipantHandle) -> bool {
@@ -2640,24 +2603,11 @@ fn participant_handle_matches(current: &ParticipantHandle, updated: &Participant
 }
 
 fn is_state_revision_conflict(error: &Error) -> bool {
-    matches!(error, Error::StateConflict(message) if message.contains("revision changed"))
+    error.mutation_code() == Some(crate::MutationCode::RevisionChanged)
 }
 
 fn is_terminal_participant_conflict(error: &Error) -> bool {
-    let Error::StateConflict(message) = error else {
-        return false;
-    };
-    (message.starts_with("Concord contract ")
-        && (message.contains(" is missing") || message.contains(" is cancelled")))
-        || [
-            "Concord contract is missing",
-            "Concord contract is cancelled",
-            "Concord participant token is missing",
-            "Concord participant token changed owner",
-            "Concord participant is already attached",
-        ]
-        .iter()
-        .any(|part| message.contains(part))
+    error.is_state_conflict()
 }
 
 fn terminal_managed_status(status: ContractValidityStatus) -> bool {
@@ -2676,13 +2626,13 @@ fn terminal_managed_status(status: ContractValidityStatus) -> bool {
 
 fn defer_unmanaged_missing_token(
     status: ContractValidityStatus,
-    reason: Option<&str>,
+    missing: Option<&EndpointAddress>,
     participant: &EndpointAddress,
     lease: Option<&ConcordParticipantLease>,
 ) -> bool {
     status == ContractValidityStatus::MissingToken
         && lease.is_none()
-        && reason.is_some_and(|missing_participant| missing_participant != participant.as_str())
+        && missing.is_some_and(|missing_participant| missing_participant != participant)
 }
 
 fn managed_cancel_terminal_status(status: ContractValidityStatus) -> bool {
@@ -2809,106 +2759,77 @@ fn default_contract_state() -> ContractState {
     ContractState::Open
 }
 
-fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+fn checked_contract(entry: StateEntry, handle: &ContractHandle) -> Result<ContractRecord> {
+    let record = ContractRecord::from_value(entry.value).map_err(|error| {
+        Error::mutation(crate::MutationCode::ContractInvalid, error.to_string())
+    })?;
+    if entry.key != handle.key
+        || entry.key != make_concord_contract_key(&record.contract_id, record.generation)
+        || record.contract_id != handle.contract_id
+        || record.generation != handle.generation
+        || record.participants != handle.participants
+        || record.profile != handle.profile
+        || record.terms_hash != handle.terms_hash
+    {
+        return Err(Error::mutation(
+            crate::MutationCode::ContractIdentityMismatch,
+            "Concord contract identity changed",
+        ));
+    }
+    Ok(record)
 }
 
-fn evaluate_observations(
-    contract: &ContractHandle,
-    contract_entry: Option<StateEntry>,
-    token_entries: &BTreeMap<String, StateEntry>,
-    current_sessions: Option<&BTreeMap<String, String>>,
-) -> ContractValidity {
-    let Some(contract_entry) = contract_entry else {
-        return validity(ContractValidityStatus::MissingContract, None, None);
+fn checked_token(entry: &StateEntry, handle: &ParticipantHandle) -> Result<ParticipantTokenRecord> {
+    let token = ParticipantTokenRecord::from_value(entry.value.clone())
+        .map_err(|error| Error::mutation(crate::MutationCode::TokenInvalid, error.to_string()))?;
+    if entry.key != handle.key
+        || entry.key
+            != make_concord_participant_token_key(
+                &token.contract_id,
+                token.generation,
+                &token.participant,
+            )
+        || !token_matches_handle(&token, handle)
+    {
+        return Err(Error::mutation(
+            crate::MutationCode::TokenIdentityMismatch,
+            "Concord participant token changed owner",
+        ));
+    }
+    Ok(token)
+}
+
+fn proposal_record(
+    mut spec: CreateContractSpec,
+    clock: &dyn crate::lifecycle::Clock,
+) -> Result<ContractRecord> {
+    spec.participants.sort();
+    let terms_hash = spec
+        .terms
+        .as_ref()
+        .map(canonical_json_hash_value)
+        .transpose()?;
+    let record = ContractRecord {
+        schema_id: CONCORD_CONTRACT_SCHEMA_ID.to_string(),
+        contract_id: spec
+            .contract_id
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        generation: spec.generation,
+        participants: spec.participants,
+        attached_participants: Vec::new(),
+        state: ContractState::Open,
+        profile: spec.profile,
+        terms_hash,
+        terms: spec.terms,
+        created_by: spec.created_by,
+        participant_sessions: spec.participant_sessions,
+        created_at: Some(clock.utc_now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+        cancelled_by: None,
+        cancelled_at: None,
+        cancel_revision: None,
+        cancel_reason: None,
+        supersedes: spec.supersedes,
     };
-    let record = match ContractRecord::from_value(contract_entry.value) {
-        Ok(record) => record,
-        Err(error) => {
-            return ContractValidity {
-                status: ContractValidityStatus::InvalidContract,
-                contract: None,
-                tokens: BTreeMap::new(),
-                reason: Some(error.to_string()),
-            }
-        }
-    };
-    if record.contract_id != contract.contract_id || record.generation != contract.generation {
-        return validity(
-            ContractValidityStatus::GenerationMismatch,
-            Some(record),
-            None,
-        );
-    }
-    if record.state == ContractState::Cancelled {
-        return validity(
-            ContractValidityStatus::Cancelled,
-            Some(record),
-            None::<String>,
-        );
-    }
-    let attached = record
-        .attached_participants
-        .iter()
-        .map(ToString::to_string)
-        .collect::<BTreeSet<_>>();
-    let mut pending_participant = None::<String>;
-    let mut tokens = BTreeMap::new();
-    for participant in &record.participants {
-        let participant_key = participant.to_string();
-        let token_key =
-            make_concord_participant_token_key(&record.contract_id, record.generation, participant);
-        let token_entry = token_entries.get(&token_key).cloned();
-        let Some(token_entry) = token_entry else {
-            if attached.contains(&participant_key) {
-                return ContractValidity {
-                    status: ContractValidityStatus::MissingToken,
-                    contract: Some(record),
-                    tokens,
-                    reason: Some(participant_key),
-                };
-            }
-            pending_participant.get_or_insert(participant_key);
-            continue;
-        };
-        let token = match ParticipantTokenRecord::from_value(token_entry.value) {
-            Ok(token) => token,
-            Err(error) => {
-                return ContractValidity {
-                    status: ContractValidityStatus::InvalidToken,
-                    contract: Some(record),
-                    tokens,
-                    reason: Some(error.to_string()),
-                }
-            }
-        };
-        if let Some(status) = token_validity_status(&token, &record, participant, current_sessions)
-        {
-            tokens.insert(participant_key, token);
-            return ContractValidity {
-                status,
-                contract: Some(record),
-                tokens,
-                reason: None,
-            };
-        }
-        tokens.insert(participant_key.clone(), token);
-        if !attached.contains(&participant_key) {
-            pending_participant.get_or_insert(participant_key);
-        }
-    }
-    if let Some(participant) = pending_participant {
-        return ContractValidity {
-            status: ContractValidityStatus::NotYetFulfilled,
-            contract: Some(record),
-            tokens,
-            reason: Some(participant),
-        };
-    }
-    ContractValidity {
-        status: ContractValidityStatus::Valid,
-        contract: Some(record),
-        tokens,
-        reason: None,
-    }
+    record.validate()?;
+    Ok(record)
 }

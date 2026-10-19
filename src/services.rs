@@ -1,20 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-use tokio::time;
 
-use crate::beacon::{Beacon, Candidate};
+use crate::beacon::Candidate;
 use crate::concord::CreateContractSpec;
 use crate::endpoint::{service_address, EndpointAddress};
 use crate::keys::encode_key_token;
 use crate::state::StateStore;
 use crate::{Error, Result};
+
+mod message;
+pub use message::*;
+mod declaration;
+pub use declaration::*;
+mod context;
+pub use context::*;
+mod views;
+pub use views::*;
+mod directory;
+pub use directory::*;
+mod connection;
+pub use connection::*;
+mod client;
+pub use client::*;
+mod provider;
+pub use provider::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -25,17 +36,26 @@ pub enum ServiceBackendStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceViewFamily {
     pub store_name: String,
     pub key_prefix: String,
+    pub writer: ServiceViewWriter,
 }
 
 impl ServiceViewFamily {
     pub fn new(store_name: impl Into<String>, key_prefix: impl Into<String>) -> Result<Self> {
+        Self::with_writer(store_name, key_prefix, ServiceViewWriter::Service)
+    }
+    pub fn with_writer(
+        store_name: impl Into<String>,
+        key_prefix: impl Into<String>,
+        writer: ServiceViewWriter,
+    ) -> Result<Self> {
         let family = Self {
             store_name: store_name.into(),
             key_prefix: key_prefix.into(),
+            writer,
         };
         family.validate()?;
         Ok(family)
@@ -48,15 +68,20 @@ impl ServiceViewFamily {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceViewFamilyDefinition {
     pub store_name: String,
+    pub writer: ServiceViewWriter,
 }
 
 impl ServiceViewFamilyDefinition {
     pub fn new(store_name: impl Into<String>) -> Result<Self> {
+        Self::with_writer(store_name, ServiceViewWriter::Service)
+    }
+    pub fn with_writer(store_name: impl Into<String>, writer: ServiceViewWriter) -> Result<Self> {
         let definition = Self {
             store_name: store_name.into(),
+            writer,
         };
         definition.validate()?;
         Ok(definition)
@@ -67,13 +92,15 @@ impl ServiceViewFamilyDefinition {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceProtocol {
     pub namespace: String,
     pub feature_id: String,
     pub advertisement_profile: String,
     pub use_profile: String,
-    pub operations: BTreeSet<String>,
+    pub operations: BTreeMap<String, ServiceOperationDefinition>,
+    pub messages: BTreeMap<String, ServiceMessageDefinition>,
     pub view_families: BTreeMap<String, ServiceViewFamilyDefinition>,
 }
 
@@ -91,7 +118,11 @@ impl ServiceProtocol {
             feature_id: feature_id.into(),
             advertisement_profile: advertisement_profile.into(),
             use_profile: use_profile.into(),
-            operations: operations.into_iter().map(Into::into).collect(),
+            operations: operations
+                .into_iter()
+                .map(|name| (name.into(), ServiceOperationDefinition::default()))
+                .collect(),
+            messages: BTreeMap::new(),
             view_families,
         };
         protocol.validate()?;
@@ -103,19 +134,41 @@ impl ServiceProtocol {
         require_text(&self.feature_id, "service feature id")?;
         require_text(&self.advertisement_profile, "service advertisement profile")?;
         require_text(&self.use_profile, "service use profile")?;
-        if self.operations.is_empty() {
-            return Err(Error::Invalid(
-                "service protocol operations must not be empty".to_string(),
-            ));
-        }
-        for operation in &self.operations {
+        for (operation, definition) in &self.operations {
             require_text(operation, "service operation")?;
+            definition.validate()?;
+        }
+        for (name, message) in &self.messages {
+            require_text(name, "service message name")?;
+            message.validate()?;
+            if message
+                .operation
+                .as_ref()
+                .is_some_and(|operation| !self.operations.contains_key(operation))
+            {
+                return Err(Error::Invalid(
+                    "service message operation is not declared".into(),
+                ));
+            }
         }
         for (name, family) in &self.view_families {
             require_text(name, "service view family name")?;
             family.validate()?;
         }
         Ok(())
+    }
+
+    pub fn from_value(value: Value) -> Result<Self> {
+        let protocol: Self = serde_json::from_value(value)?;
+        protocol.validate()?;
+        Ok(protocol)
+    }
+    pub fn from_text(text: &str) -> Result<Self> {
+        Self::from_value(crate::json::parse(text.as_bytes())?)
+    }
+    pub fn to_value(&self) -> Result<Value> {
+        self.validate()?;
+        Ok(serde_json::to_value(self)?)
     }
 
     pub fn advertisement_payload(
@@ -125,7 +178,8 @@ impl ServiceProtocol {
         backend_status: ServiceBackendStatus,
     ) -> Result<ServiceAdvertisementPayload> {
         let service_id = service_id.into();
-        ServiceAdvertisementPayload::new(
+        self.validate()?;
+        let mut payload = ServiceAdvertisementPayload::new(
             self.advertisement_profile.clone(),
             service_id.clone(),
             EndpointAddress::parse(service_address(&service_id))?,
@@ -133,15 +187,18 @@ impl ServiceProtocol {
             session_id.into(),
             self.use_profile.clone(),
             backend_status,
-            self.operations.iter().cloned().collect(),
+            self.operations.keys().cloned().collect(),
             service_protocol_views(self, &service_id)?,
             BTreeMap::new(),
-        )
+        )?;
+        payload.supported_messages = self.messages.clone();
+        payload.validate()?;
+        Ok(payload)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceAdvertisementPayload {
     pub profile: String,
     pub service_id: String,
@@ -151,8 +208,13 @@ pub struct ServiceAdvertisementPayload {
     pub service_use_profile: String,
     pub backend_status: ServiceBackendStatus,
     pub supported_operations: Vec<String>,
+    pub supported_messages: BTreeMap<String, ServiceMessageDefinition>,
     pub views: BTreeMap<String, ServiceViewFamily>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_ordered_object",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub diagnostics: BTreeMap<String, Value>,
 }
 
@@ -179,6 +241,7 @@ impl ServiceAdvertisementPayload {
             service_use_profile,
             backend_status,
             supported_operations,
+            supported_messages: BTreeMap::new(),
             views,
             diagnostics,
         };
@@ -190,6 +253,9 @@ impl ServiceAdvertisementPayload {
         let payload: Self = serde_json::from_value(value)?;
         payload.validate()?;
         Ok(payload)
+    }
+    pub fn from_text(text: &str) -> Result<Self> {
+        Self::from_value(crate::json::parse(text.as_bytes())?)
     }
 
     pub fn to_value(&self) -> Result<Value> {
@@ -208,17 +274,34 @@ impl ServiceAdvertisementPayload {
                 "serviceEndpoint must equal service:<serviceId>".to_string(),
             ));
         }
-        if self.supported_operations.is_empty() {
-            return Err(Error::Invalid(
-                "service advertisement requires operations".to_string(),
-            ));
-        }
+        let mut unique = BTreeSet::new();
         for operation in &self.supported_operations {
             require_text(operation, "service operation")?;
+            if !unique.insert(operation) {
+                return Err(Error::Invalid(
+                    "service advertisement repeats an operation".into(),
+                ));
+            }
+        }
+        for (name, message) in &self.supported_messages {
+            require_text(name, "advertised service message name")?;
+            message.validate()?;
+            if message
+                .operation
+                .as_ref()
+                .is_some_and(|operation| !unique.contains(operation))
+            {
+                return Err(Error::Invalid(
+                    "advertised service message names an unsupported operation".into(),
+                ));
+            }
         }
         for (name, family) in &self.views {
             require_text(name, "service view family name")?;
             family.validate()?;
+        }
+        for value in self.diagnostics.values() {
+            crate::json::validate_numbers(value)?;
         }
         Ok(())
     }
@@ -274,9 +357,75 @@ pub struct ServiceDescriptor {
     pub advertisement_profile: String,
     pub use_profile: String,
     pub supported_operations: BTreeSet<String>,
+    pub supported_messages: BTreeMap<String, ServiceMessageDefinition>,
     pub views: BTreeMap<String, ServiceViewFamily>,
     pub backend_status: ServiceBackendStatus,
     pub diagnostics: BTreeMap<String, Value>,
+}
+
+impl ServiceDescriptor {
+    /// Validate a provider's declaration payload before it is advertised.
+    pub fn from_payload(
+        payload: ServiceAdvertisementPayload,
+        protocol: &ServiceProtocol,
+    ) -> Result<Self> {
+        payload.validate()?;
+        let descriptor = Self {
+            candidate: None,
+            service_id: payload.service_id,
+            namespace: payload.service_namespace,
+            endpoint: payload.service_endpoint,
+            session_id: payload.session_id,
+            advertisement_profile: payload.profile,
+            use_profile: payload.service_use_profile,
+            supported_operations: payload.supported_operations.into_iter().collect(),
+            supported_messages: payload.supported_messages,
+            views: payload.views,
+            backend_status: payload.backend_status,
+            diagnostics: payload.diagnostics,
+        };
+        descriptor.validate(protocol)?;
+        Ok(descriptor)
+    }
+    /// Validate a supplied descriptor against the owner declaration without
+    /// consulting discovery. Accepted agreements retain this immutable identity.
+    pub fn validate(&self, protocol: &ServiceProtocol) -> Result<()> {
+        protocol.validate()?;
+        require_text(&self.service_id, "service id")?;
+        require_text(&self.session_id, "service session id")?;
+        if self.endpoint != EndpointAddress::parse(service_address(&self.service_id))?
+            || self.namespace != protocol.namespace
+            || self.advertisement_profile != protocol.advertisement_profile
+            || self.use_profile != protocol.use_profile
+            || self
+                .supported_operations
+                .iter()
+                .any(|operation| !protocol.operations.contains_key(operation))
+            || self.supported_messages.iter().any(|(name, message)| {
+                protocol.messages.get(name) != Some(message)
+                    || message
+                        .operation
+                        .as_ref()
+                        .is_some_and(|operation| !self.supported_operations.contains(operation))
+            })
+            || self.views != service_protocol_views(protocol, &self.service_id)?
+        {
+            return Err(Error::Invalid(
+                "service descriptor differs from its declaration".into(),
+            ));
+        }
+        if let Some(candidate) = &self.candidate {
+            let parsed = parse_service_descriptor(candidate, protocol).ok_or_else(|| {
+                Error::Invalid("service descriptor has an invalid source candidate".into())
+            })?;
+            if &parsed != self {
+                return Err(Error::Invalid(
+                    "service descriptor differs from its source candidate".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn parse_service_descriptor(
@@ -310,7 +459,17 @@ pub fn parse_service_descriptor(
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    if !advertised_operations.is_subset(&protocol.operations) {
+    if advertised_operations
+        .iter()
+        .any(|operation| !protocol.operations.contains_key(operation))
+    {
+        return None;
+    }
+    if payload
+        .supported_messages
+        .iter()
+        .any(|(name, message)| protocol.messages.get(name) != Some(message))
+    {
         return None;
     }
     let expected_views = service_protocol_views(protocol, &payload.service_id).ok()?;
@@ -326,6 +485,7 @@ pub fn parse_service_descriptor(
         advertisement_profile: payload.profile,
         use_profile: payload.service_use_profile,
         supported_operations: advertised_operations,
+        supported_messages: payload.supported_messages,
         views: expected_views,
         backend_status: payload.backend_status,
         diagnostics: payload.diagnostics,
@@ -425,239 +585,6 @@ pub struct ServiceQuery {
     pub session_id: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct ServiceDirectory<S: StateStore> {
-    beacon: Beacon<S>,
-    protocol: ServiceProtocol,
-    inner: Arc<Mutex<ServiceDirectoryInner>>,
-    ready: Arc<Notify>,
-    watch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-}
-
-#[derive(Debug, Default)]
-struct ServiceDirectoryInner {
-    ready: bool,
-    current: bool,
-    closed: bool,
-    descriptors_by_key: BTreeMap<String, ServiceDescriptor>,
-    by_service_id: BTreeMap<String, BTreeSet<String>>,
-    by_namespace: BTreeMap<String, BTreeSet<String>>,
-    by_use_profile: BTreeMap<String, BTreeSet<String>>,
-    by_operation: BTreeMap<String, BTreeSet<String>>,
-    by_view_family: BTreeMap<String, BTreeSet<String>>,
-    by_endpoint: BTreeMap<String, BTreeSet<String>>,
-    by_session: BTreeMap<(String, String), BTreeSet<String>>,
-}
-
-impl<S: StateStore> ServiceDirectory<S> {
-    pub fn new(beacon: Beacon<S>, protocol: ServiceProtocol) -> Result<Self> {
-        protocol.validate()?;
-        Ok(Self {
-            beacon,
-            protocol,
-            inner: Arc::new(Mutex::new(ServiceDirectoryInner::default())),
-            ready: Arc::new(Notify::new()),
-            watch_task: Arc::new(Mutex::new(None)),
-        })
-    }
-
-    pub fn protocol(&self) -> &ServiceProtocol {
-        &self.protocol
-    }
-
-    pub fn start(&self) {
-        let mut watch_task = self
-            .watch_task
-            .lock()
-            .expect("service directory task mutex poisoned");
-        if watch_task.is_some() {
-            return;
-        }
-        let directory = self.clone();
-        *watch_task = Some(tokio::spawn(async move {
-            directory.event_loop().await;
-        }));
-    }
-
-    pub async fn wait_ready(&self) {
-        loop {
-            let notified = self.ready.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self
-                .inner
-                .lock()
-                .expect("service directory mutex poisoned")
-                .ready
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    pub fn is_current(&self) -> bool {
-        let inner = self.inner.lock().expect("service directory mutex poisoned");
-        inner.ready && inner.current
-    }
-
-    pub fn descriptors(&self) -> Vec<ServiceDescriptor> {
-        let mut descriptors = self
-            .inner
-            .lock()
-            .expect("service directory mutex poisoned")
-            .descriptors_by_key
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        descriptors.sort_by_key(service_descriptor_sort_key);
-        descriptors
-    }
-
-    pub fn match_services(&self, query: &ServiceQuery) -> Vec<ServiceDescriptor> {
-        let inner = self.inner.lock().expect("service directory mutex poisoned");
-        if !inner.current || inner.closed {
-            return Vec::new();
-        }
-        let mut keys = inner
-            .descriptors_by_key
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        intersect_optional(&mut keys, &inner.by_service_id, query.service_id.as_deref());
-        intersect_optional(&mut keys, &inner.by_namespace, query.namespace.as_deref());
-        intersect_optional(
-            &mut keys,
-            &inner.by_use_profile,
-            query.use_profile.as_deref(),
-        );
-        if let Some(endpoint) = &query.endpoint {
-            intersect_optional(&mut keys, &inner.by_endpoint, Some(endpoint.as_str()));
-        }
-        if let Some(session_id) = &query.session_id {
-            match &query.endpoint {
-                Some(endpoint) => {
-                    intersect_set(
-                        &mut keys,
-                        inner
-                            .by_session
-                            .get(&(endpoint.as_str().to_string(), session_id.clone())),
-                    );
-                }
-                None => keys.retain(|key| {
-                    inner
-                        .by_session
-                        .iter()
-                        .any(|((_, indexed_session), session_keys)| {
-                            indexed_session == session_id && session_keys.contains(key)
-                        })
-                }),
-            }
-        }
-        for operation in &query.operations {
-            intersect_set(&mut keys, inner.by_operation.get(operation));
-        }
-        for family in &query.views {
-            intersect_set(&mut keys, inner.by_view_family.get(family));
-        }
-        let mut descriptors = keys
-            .into_iter()
-            .filter_map(|key| inner.descriptors_by_key.get(&key).cloned())
-            .collect::<Vec<_>>();
-        descriptors.sort_by_key(service_descriptor_sort_key);
-        descriptors
-    }
-
-    pub fn close(&self) {
-        {
-            let mut inner = self.inner.lock().expect("service directory mutex poisoned");
-            inner.closed = true;
-            inner.current = false;
-            inner.ready = true;
-            self.ready.notify_waiters();
-        }
-        if let Some(task) = self
-            .watch_task
-            .lock()
-            .expect("service directory task mutex poisoned")
-            .take()
-        {
-            task.abort();
-        }
-    }
-
-    async fn event_loop(self) {
-        loop {
-            if self
-                .inner
-                .lock()
-                .expect("service directory mutex poisoned")
-                .closed
-            {
-                return;
-            }
-            match self.beacon.watch_state(&self.protocol.feature_id) {
-                Ok(mut snapshots) => {
-                    while let Some(snapshot) = snapshots.next().await {
-                        let mut inner =
-                            self.inner.lock().expect("service directory mutex poisoned");
-                        if inner.closed {
-                            return;
-                        }
-                        let mut replacement = ServiceDirectoryInner {
-                            ready: true,
-                            current: snapshot.current,
-                            closed: snapshot.closed,
-                            ..Default::default()
-                        };
-                        for candidate in snapshot.candidates {
-                            if let Some(descriptor) =
-                                parse_service_descriptor(&candidate, &self.protocol)
-                            {
-                                replacement.add(candidate.key, descriptor);
-                            }
-                        }
-                        *inner = replacement;
-                        self.ready.notify_waiters();
-                        if snapshot.closed {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => {
-                    let mut inner = self.inner.lock().expect("service directory mutex poisoned");
-                    inner.ready = true;
-                    inner.current = false;
-                    self.ready.notify_waiters();
-                }
-            }
-            time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-}
-
-impl ServiceDirectoryInner {
-    fn add(&mut self, key: String, descriptor: ServiceDescriptor) {
-        index(&mut self.by_service_id, &descriptor.service_id, &key);
-        index(&mut self.by_namespace, &descriptor.namespace, &key);
-        index(&mut self.by_use_profile, &descriptor.use_profile, &key);
-        index(&mut self.by_endpoint, descriptor.endpoint.as_str(), &key);
-        index_session(
-            &mut self.by_session,
-            descriptor.endpoint.as_str(),
-            &descriptor.session_id,
-            &key,
-        );
-        for operation in &descriptor.supported_operations {
-            index(&mut self.by_operation, operation, &key);
-        }
-        for family in descriptor.views.keys() {
-            index(&mut self.by_view_family, family, &key);
-        }
-        self.descriptors_by_key.insert(key, descriptor);
-    }
-}
-
 pub trait ServiceSelectionPolicy: Send + Sync + 'static {
     fn select(&self, descriptors: Vec<ServiceDescriptor>) -> Option<ServiceDescriptor>;
 }
@@ -725,9 +652,10 @@ fn service_protocol_views(
         .map(|(family, definition)| {
             Ok((
                 family.clone(),
-                ServiceViewFamily::new(
+                ServiceViewFamily::with_writer(
                     definition.store_name.clone(),
                     service_view_prefix(service_id, family),
+                    definition.writer,
                 )?,
             ))
         })

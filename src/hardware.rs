@@ -9,6 +9,9 @@ use crate::profiles::hardware::{
 };
 use crate::Result;
 
+pub mod client;
+pub mod validation;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HardwareClaimRoute {
     controller_endpoint: EndpointAddress,
@@ -219,28 +222,34 @@ pub mod runtime {
     use std::sync::Arc;
 
     use futures_core::Stream;
-    use futures_util::StreamExt;
+    use futures_util::{FutureExt, StreamExt};
     use serde_json::Value;
-    use tokio::sync::Mutex;
+    use tokio::sync::{watch, Mutex};
     use tokio::task::JoinSet;
     use tokio::time;
     use uuid::Uuid;
 
     use crate::authority::ContractPointer;
-    use crate::beacon::{AdvertisementHandle, BeaconAdvertiser};
+    use crate::beacon::{
+        AdvertisementContent, AdvertisementState, BeaconAdvertiser, ManagedAdvertisement,
+    };
     use crate::concord::{
-        ConcordContractNotification, ConcordCoordinator, ConcordManagedContract,
-        ConcordParticipantManager, ContractHandle, ContractRecord,
+        AgreementContext, ConcordCoordinator, ConcordManagedContract, ContractHandle,
+        ContractRecord, ManagedParticipant, ParticipantCandidates, ParticipantState,
     };
     use crate::endpoint::{hardware_manager_address, EndpointAddress};
     use crate::lanes::{DeckrMessage, DeviceDescriptor, HardwareMessageBody};
+    use crate::lifecycle::{Cancellation, Clock, Failure, Phase, Snapshot, StateCell, StateWatch};
+    use crate::messaging::{Delivery, DeliveryStream, MessageTransport};
     use crate::profiles::hardware::{
         HardwareClaimTerms, HARDWARE_CLAIM_PROFILE_ID, HARDWARE_FEATURE_ID,
     };
     use crate::state::{MaterializedStateStore, StateMaintenancePolicy, StateStore};
     use crate::{Error, Result};
 
+    use super::validation::ValidatedDevice;
     use super::{hardware_beacon_payload, HardwareClaimReconcile, HardwareClaimRouting};
+    use crate::schema::SchemaRegistry;
 
     #[derive(Debug, Clone, PartialEq)]
     enum HardwareCommandDecision {
@@ -261,6 +270,26 @@ pub mod runtime {
         Rejected,
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct HardwareManagerDiagnostics {
+        pub discovery_error: Option<String>,
+        pub last_message_error: Option<String>,
+        pub rejected_messages: u64,
+    }
+
+    /// Complete observed state of this manager. Discovery and participation
+    /// retain separate readiness and failure information: discovery loss alone
+    /// does not revoke a claim whose agreement still has local authority.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct HardwareRuntimeState {
+        pub endpoint: EndpointAddress,
+        pub session_id: String,
+        pub devices: BTreeMap<String, DeviceDescriptor>,
+        pub participation: Option<Snapshot<ParticipantState>>,
+        pub discovery: Option<Snapshot<AdvertisementState>>,
+        pub diagnostics: HardwareManagerDiagnostics,
+    }
+
     impl HardwareCommandOutcome {
         fn rejection(&self) -> Option<&'static str> {
             match self {
@@ -274,12 +303,63 @@ pub mod runtime {
 
     pub type HardwareCommandFuture<'a> =
         Pin<Box<dyn Future<Output = Result<HardwareCommandOutcome>> + Send + 'a>>;
+    type HardwareReply = Arc<
+        dyn Fn(HardwareMessageBody) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    /// Driver work scoped to the validated request, stable device descriptor
+    /// and exact agreement. Recheck after awaiting device/application work.
+    #[derive(Clone)]
+    pub struct HardwareCommandContext {
+        message: DeckrMessage,
+        device: Arc<ValidatedDevice>,
+        authority: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: HardwareReply,
+    }
+    impl HardwareCommandContext {
+        pub fn message(&self) -> &DeckrMessage {
+            &self.message
+        }
+        pub fn device(&self) -> &DeviceDescriptor {
+            self.device.descriptor()
+        }
+        pub fn authorize(&self) -> Result<()> {
+            (self.authority)()
+        }
+        /// Send a response to this request, preserving its route, exact pointer,
+        /// sessions and correlation. The body must match the requested device,
+        /// capability and command/state operation. Authority is checked again
+        /// after payload validation and before publication.
+        pub async fn reply(&self, body: HardwareMessageBody) -> Result<()> {
+            self.authorize()?;
+            (self.reply)(body).await?;
+            self.authorize()
+        }
+    }
 
     pub trait HardwareCommandHandler: Send + Sync + 'static {
+        /// Compatibility callback for immediate driver operations.
         fn handle_hardware_command<'a>(
             &'a self,
-            message: DeckrMessage,
-        ) -> HardwareCommandFuture<'a>;
+            _message: DeckrMessage,
+        ) -> HardwareCommandFuture<'a> {
+            Box::pin(async { Ok(HardwareCommandOutcome::Unsupported) })
+        }
+
+        /// Override this for asynchronous driver work. The context permanently
+        /// loses authority when its agreement ends or the device is replaced.
+        fn handle_authorized_hardware_command<'a>(
+            &'a self,
+            context: HardwareCommandContext,
+        ) -> HardwareCommandFuture<'a> {
+            Box::pin(async move {
+                context.authorize()?;
+                self.handle_hardware_command(context.message().clone())
+                    .await
+            })
+        }
     }
 
     impl<F, Fut> HardwareCommandHandler for F
@@ -324,6 +404,73 @@ pub mod runtime {
             &'a self,
             endpoint: &'a EndpointAddress,
         ) -> impl Future<Output = Result<HardwareMessageStream>> + Send + 'a;
+
+        /// Compatibility transports without return routes use ordinary lane replies.
+        fn subscribe_hardware_deliveries<'a>(
+            &'a self,
+            endpoint: &'a EndpointAddress,
+        ) -> impl Future<Output = Result<DeliveryStream>> + Send + 'a {
+            async move {
+                let source = self.subscribe_hardware_messages(endpoint).await?;
+                Ok(Box::pin(source.map(|message| {
+                    message.map(|message| Delivery {
+                        message,
+                        reply_address: None,
+                    })
+                })) as DeliveryStream)
+            }
+        }
+
+        fn publish_hardware_reply(
+            &self,
+            message: DeckrMessage,
+            reply_address: Option<String>,
+        ) -> impl Future<Output = Result<()>> + Send + '_ {
+            async move {
+                if reply_address.is_some() {
+                    return Err(Error::Unsupported(
+                        "hardware transport does not support reply inboxes".into(),
+                    ));
+                }
+                self.publish_hardware_message(message).await
+            }
+        }
+    }
+
+    /// Compose a host's ordinary message adapter with the managed hardware
+    /// boundary. The boundary retains application authorization and validation.
+    #[derive(Clone)]
+    pub struct HardwareTransport<T: MessageTransport>(pub T);
+    impl<T: MessageTransport> HardwareLaneTransport for HardwareTransport<T> {
+        async fn publish_hardware_message(&self, message: DeckrMessage) -> Result<()> {
+            self.0.publish(&message, None, None).await
+        }
+        async fn publish_hardware_reply(
+            &self,
+            message: DeckrMessage,
+            reply_address: Option<String>,
+        ) -> Result<()> {
+            self.0
+                .publish(&message, reply_address.as_deref(), None)
+                .await
+        }
+        async fn subscribe_hardware_messages<'a>(
+            &'a self,
+            endpoint: &'a EndpointAddress,
+        ) -> Result<HardwareMessageStream> {
+            let stream = self.subscribe_hardware_deliveries(endpoint).await?;
+            Ok(Box::pin(
+                stream.map(|delivery| delivery.map(|delivery| delivery.message)),
+            ))
+        }
+        async fn subscribe_hardware_deliveries<'a>(
+            &'a self,
+            endpoint: &'a EndpointAddress,
+        ) -> Result<DeliveryStream> {
+            self.0
+                .subscribe(crate::lanes::HARDWARE_MESSAGES_LANE, endpoint)
+                .await
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -408,11 +555,9 @@ pub mod runtime {
             )
         }
 
-        fn set_device(&mut self, descriptor: DeviceDescriptor) -> Result<()> {
-            descriptor.validate()?;
+        fn set_device(&mut self, descriptor: DeviceDescriptor) {
             self.devices
                 .insert(descriptor.device_id.clone(), descriptor);
-            Ok(())
         }
 
         fn remove_device(&mut self, device_id: &str) {
@@ -473,32 +618,28 @@ pub mod runtime {
             .map(Some)
         }
 
-        fn authorize_command(&self, envelope: DeckrMessage) -> Result<HardwareCommandDecision> {
-            if envelope.is_expired() {
-                return Ok(HardwareCommandDecision::Rejected {
-                    reason: "expired".to_string(),
-                    reply: self.command_rejection_reply(&envelope, "expired")?,
-                    refresh_claims: false,
-                });
+        fn authorize_command(
+            &self,
+            envelope: DeckrMessage,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<HardwareCommandDecision> {
+            if envelope.recipient_endpoint() != Some(self.endpoint.as_str())
+                || envelope
+                    .recipient_session_id
+                    .as_deref()
+                    .is_some_and(|id| id != self.session_id)
+                || envelope.is_expired_at(now)
+            {
+                return Ok(HardwareCommandDecision::Ignored);
             }
             if envelope.contract.is_none() {
-                if envelope.recipient_endpoint() != Some(self.endpoint.as_str())
-                    || envelope
-                        .recipient_session_id
-                        .as_deref()
-                        .is_some_and(|session_id| session_id != self.session_id)
-                {
-                    return Ok(HardwareCommandDecision::Ignored);
-                }
                 return Ok(HardwareCommandDecision::Rejected {
                     reason: "unauthorized".to_string(),
                     reply: None,
                     refresh_claims: false,
                 });
             }
-            if !envelope.is_directly_deliverable_to(&self.endpoint, &self.session_id)? {
-                return Ok(HardwareCommandDecision::Ignored);
-            }
+            envelope.validate()?;
             let body = match envelope.hardware_body() {
                 Ok(body) => body,
                 Err(error) => {
@@ -656,6 +797,10 @@ pub mod runtime {
             return Ok(false);
         }
         for device in &terms.devices {
+            // This manager exposes one instance of each connected device.
+            if device.instance_count != 1 {
+                return Ok(false);
+            }
             let device_ref = &device.device_ref;
             if device_ref.manager_id != manager_id {
                 return Ok(false);
@@ -688,6 +833,9 @@ pub mod runtime {
         pub concord_contract_state: C,
         pub concord_token_state: T,
         pub lane: L,
+        /// Compatibility configuration for callers of the original runtime.
+        /// Managed publication and token workers now schedule from store TTLs;
+        /// these intervals do not control their lifetimes or run periodic repair.
         pub maintenance_policy: StateMaintenancePolicy,
         pub command_handler: Arc<dyn HardwareCommandHandler>,
         pub reset_handler: Option<Arc<dyn HardwareResetHandler>>,
@@ -695,8 +843,74 @@ pub mod runtime {
 
     type MaterializedConcord<C, T> =
         ConcordCoordinator<MaterializedStateStore<C>, MaterializedStateStore<T>>;
-    type MaterializedParticipantManager<C, T> =
-        ConcordParticipantManager<MaterializedStateStore<C>, MaterializedStateStore<T>>;
+    type MaterializedTermination<C, T> = AgreementContext<C, T>;
+
+    #[derive(Clone, PartialEq)]
+    struct DiscoveryIntent {
+        version: u64,
+        content: AdvertisementContent,
+    }
+    struct HardwareDiscovery {
+        desired: watch::Sender<DiscoveryIntent>,
+        attempted: watch::Sender<Option<u64>>,
+        publication: std::sync::Mutex<Option<ManagedAdvertisement>>,
+        stop: Cancellation,
+    }
+    impl HardwareDiscovery {
+        fn new() -> Self {
+            Self {
+                desired: watch::channel(DiscoveryIntent {
+                    version: 0,
+                    content: AdvertisementContent::default(),
+                })
+                .0,
+                attempted: watch::channel(None).0,
+                publication: std::sync::Mutex::new(None),
+                stop: Cancellation::default(),
+            }
+        }
+        fn update(&self, content: AdvertisementContent) {
+            self.desired.send_if_modified(|intent| {
+                if intent.content == content {
+                    return false;
+                }
+                intent.version += 1;
+                intent.content = content;
+                true
+            });
+        }
+        fn publication(&self) -> Option<ManagedAdvertisement> {
+            self.publication
+                .lock()
+                .expect("hardware publication lock poisoned")
+                .clone()
+        }
+        fn request_close(&self) {
+            self.stop.cancel();
+            if let Some(publication) = self.publication() {
+                publication.request_close();
+            }
+        }
+        async fn synchronize(&self) {
+            if self.publication().is_none() {
+                return;
+            }
+            let version = self.desired.borrow().version;
+            let mut attempted = self.attempted.subscribe();
+            loop {
+                if attempted
+                    .borrow_and_update()
+                    .is_some_and(|done| done >= version)
+                {
+                    return;
+                }
+                tokio::select! {
+                    _ = self.stop.cancelled() => return,
+                    _ = attempted.changed() => {},
+                }
+            }
+        }
+    }
 
     pub struct HardwareManagerRuntime<B, C, T, L>
     where
@@ -708,21 +922,53 @@ pub mod runtime {
         inner: Arc<Mutex<HardwareManagerRuntimeInner<B, C, T, L>>>,
         lifecycle: Arc<HardwareLifecycle>,
         sources: MaterializedConcord<C, T>,
+        owns_sources: bool,
+        discovery: Arc<HardwareDiscovery>,
+        observed: StateCell<HardwareRuntimeState>,
+        schemas: SchemaRegistry,
     }
 
-    #[derive(Default)]
     struct HardwareLifecycle {
         closed: AtomicBool,
         started: AtomicBool,
+        claims_ready: AtomicBool,
+        initialized: AtomicBool,
+        failure: std::sync::Mutex<Option<Failure>>,
+        cleanup_started: AtomicBool,
+        cleanup_status: watch::Sender<Option<std::result::Result<(), String>>>,
         active: AtomicUsize,
         workers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
         changed: tokio::sync::Notify,
+    }
+    impl Default for HardwareLifecycle {
+        fn default() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+                started: AtomicBool::new(false),
+                claims_ready: AtomicBool::new(false),
+                initialized: AtomicBool::new(false),
+                failure: std::sync::Mutex::new(None),
+                cleanup_started: AtomicBool::new(false),
+                cleanup_status: watch::channel(None).0,
+                active: AtomicUsize::new(0),
+                workers: std::sync::Mutex::new(Vec::new()),
+                changed: tokio::sync::Notify::new(),
+            }
+        }
     }
     struct WorkerGuard(Arc<HardwareLifecycle>);
     impl Drop for WorkerGuard {
         fn drop(&mut self) {
             self.0.active.fetch_sub(1, Ordering::SeqCst);
             self.0.changed.notify_waiters();
+        }
+    }
+    struct StartupGuard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for StartupGuard<F> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.0.take() {
+                cleanup();
+            }
         }
     }
 
@@ -738,6 +984,10 @@ pub mod runtime {
                 inner: self.inner.clone(),
                 lifecycle: self.lifecycle.clone(),
                 sources: self.sources.clone(),
+                owns_sources: self.owns_sources,
+                discovery: self.discovery.clone(),
+                observed: self.observed.clone(),
+                schemas: self.schemas.clone(),
             }
         }
     }
@@ -750,16 +1000,16 @@ pub mod runtime {
         L: HardwareLaneTransport,
     {
         state: HardwareManagerState,
+        validated_devices: BTreeMap<String, Arc<ValidatedDevice>>,
         beacon_state: B,
         advertisement_id: String,
-        advertisement_handle: Option<AdvertisementHandle>,
-        advertised_payload: Option<Value>,
+        discovery: Arc<HardwareDiscovery>,
         concord: MaterializedConcord<C, T>,
-        claim_manager: MaterializedParticipantManager<C, T>,
+        claim_manager: Option<ManagedParticipant<C, T>>,
         lane: L,
-        maintenance_policy: StateMaintenancePolicy,
         command_handler: Arc<dyn HardwareCommandHandler>,
         reset_handler: Option<Arc<dyn HardwareResetHandler>>,
+        diagnostics: HardwareManagerDiagnostics,
         closed: bool,
     }
 
@@ -771,42 +1021,80 @@ pub mod runtime {
         L: HardwareLaneTransport,
     {
         pub async fn new(spec: HardwareManagerRuntimeSpec<B, C, T, L>) -> Result<Self> {
-            let mut state = HardwareManagerState::new(&spec.manager_id, &spec.session_id)?;
-            state.set_labels(spec.labels);
+            Self::new_with_schemas(spec, SchemaRegistry::default()).await
+        }
+
+        pub async fn new_with_schemas(
+            spec: HardwareManagerRuntimeSpec<B, C, T, L>,
+            schemas: SchemaRegistry,
+        ) -> Result<Self> {
             let concord = ConcordCoordinator::new(
                 MaterializedStateStore::start(
-                    spec.concord_contract_state,
+                    spec.concord_contract_state.clone(),
                     crate::keys::concord_contracts_prefix(),
                 )
                 .await?,
                 MaterializedStateStore::start(
-                    spec.concord_token_state,
+                    spec.concord_token_state.clone(),
                     crate::keys::concord_contracts_prefix(),
                 )
                 .await?,
             );
-            let claim_manager = ConcordParticipantManager::new(
-                concord.clone(),
-                state.endpoint().clone(),
-                state.session_id().to_string(),
-            )?
-            .profile(HARDWARE_CLAIM_PROFILE_ID.to_string())
-            .token_refresh_interval(spec.maintenance_policy.concord_token_refresh_interval);
+            Self::build(spec, concord, true, schemas)
+        }
+
+        /// Borrow host-owned sources. Stopping this manager does not close them.
+        pub fn with_concord(
+            spec: HardwareManagerRuntimeSpec<B, C, T, L>,
+            concord: crate::runtime::MaterializedConcord<C, T>,
+        ) -> Result<Self> {
+            Self::with_concord_and_schemas(spec, concord, SchemaRegistry::default())
+        }
+
+        pub fn with_concord_and_schemas(
+            spec: HardwareManagerRuntimeSpec<B, C, T, L>,
+            concord: crate::runtime::MaterializedConcord<C, T>,
+            schemas: SchemaRegistry,
+        ) -> Result<Self> {
+            Self::build(spec, concord, false, schemas)
+        }
+
+        fn build(
+            spec: HardwareManagerRuntimeSpec<B, C, T, L>,
+            concord: MaterializedConcord<C, T>,
+            owns_sources: bool,
+            schemas: SchemaRegistry,
+        ) -> Result<Self> {
+            let mut state = HardwareManagerState::new(&spec.manager_id, &spec.session_id)?;
+            state.set_labels(spec.labels);
+            let discovery = Arc::new(HardwareDiscovery::new());
+            let observed = StateCell::new(HardwareRuntimeState {
+                endpoint: state.endpoint().clone(),
+                session_id: state.session_id().to_string(),
+                devices: state.devices().clone(),
+                participation: None,
+                discovery: None,
+                diagnostics: HardwareManagerDiagnostics::default(),
+            });
             Ok(Self {
                 lifecycle: Arc::default(),
                 sources: concord.clone(),
+                owns_sources,
+                discovery: discovery.clone(),
+                observed,
+                schemas,
                 inner: Arc::new(Mutex::new(HardwareManagerRuntimeInner {
                     state,
+                    validated_devices: BTreeMap::new(),
                     beacon_state: spec.beacon_state,
                     advertisement_id: format!("hardware-{}", Uuid::new_v4()),
-                    advertisement_handle: None,
-                    advertised_payload: None,
+                    discovery,
                     concord,
-                    claim_manager,
+                    claim_manager: None,
                     lane: spec.lane,
-                    maintenance_policy: spec.maintenance_policy,
                     command_handler: spec.command_handler,
                     reset_handler: spec.reset_handler,
+                    diagnostics: HardwareManagerDiagnostics::default(),
                     closed: false,
                 })),
             })
@@ -819,64 +1107,199 @@ pub mod runtime {
             if self.lifecycle.started.swap(true, Ordering::SeqCst) {
                 return Err(Error::Invalid("hardware runtime already started".into()));
             }
-            {
-                let inner = self.inner.lock().await;
-                inner.cleanup_stale_advertisement().await?;
+            let runtime = self.clone();
+            let mut startup = StartupGuard(Some(move || {
+                tokio::spawn(async move {
+                    let _ = runtime.stop().await;
+                });
+            }));
+            let result = self.start_inner(tasks).await;
+            if let Err(error) = &result {
+                self.record_failure("hardware startup", error);
+                let _ = self.stop().await;
             }
-            self.reconcile_claims("startup").await?;
-            {
-                let mut inner = self.inner.lock().await;
-                inner.publish_advertisement_if_changed(true).await?;
-            }
+            startup.0 = None;
+            result
+        }
 
+        async fn start_inner(&self, tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+            let (advertiser, endpoint, session_id, lane) = {
+                let inner = self.inner.lock().await;
+                (
+                    inner.advertiser_for_payload(inner.advertisement_payload_value()?),
+                    inner.state.endpoint().clone(),
+                    inner.state.session_id().to_string(),
+                    inner.lane.clone(),
+                )
+            };
+            let session = crate::session::EndpointSession::with_id(endpoint.clone(), session_id)?;
+            self.starting_step(self.sources.bootstrap(
+                &session,
+                Some(HARDWARE_CLAIM_PROFILE_ID),
+                true,
+            ))
+            .await?;
+            // Listening precedes discovery publication, and network I/O never
+            // holds the authority lock.
+            let messages = self
+                .starting_step(lane.subscribe_hardware_deliveries(&endpoint))
+                .await?;
+            self.starting_step(advertiser.cleanup_stale_same_endpoint())
+                .await?;
+            let weak = Arc::downgrade(&self.inner);
+            let participant = self.sources.participate(
+                session,
+                Some(HARDWARE_CLAIM_PROFILE_ID.into()),
+                move |candidates: ParticipantCandidates| {
+                    let weak = weak.clone();
+                    async move {
+                        let inner = weak
+                            .upgrade()
+                            .ok_or_else(|| Error::Closed("hardware manager dropped".into()))?;
+                        let state = inner.lock().await.state.clone();
+                        let selected: BTreeSet<_> = candidates
+                            .selected
+                            .iter()
+                            .map(|pointer| {
+                                crate::concord::concord_contract_key(
+                                    &pointer.contract_id,
+                                    pointer.generation,
+                                )
+                            })
+                            .collect();
+                        let mut contracts = candidates.contracts;
+                        contracts.sort_by(|left, right| {
+                            (!selected.contains(&left.contract.key))
+                                .cmp(&!selected.contains(&right.contract.key))
+                                .then_with(|| left.contract.key.cmp(&right.contract.key))
+                        });
+                        let mut devices = BTreeSet::new();
+                        let mut accepted = Vec::new();
+                        for candidate in contracts {
+                            let Some(record) = candidate.validity.contract else {
+                                continue;
+                            };
+                            if !state.accept_current_hardware_claim(&candidate.contract, &record)? {
+                                continue;
+                            }
+                            let terms = HardwareClaimTerms::from_value(
+                                record.terms.expect("accepted claim has terms"),
+                            )?;
+                            let requested: BTreeSet<_> = terms
+                                .devices
+                                .iter()
+                                .map(|device| device.device_ref.device_id.clone())
+                                .collect();
+                            if !requested.is_disjoint(&devices) {
+                                continue;
+                            }
+                            devices.extend(requested);
+                            accepted.push(ContractPointer {
+                                contract_id: candidate.contract.contract_id,
+                                generation: candidate.contract.generation,
+                            });
+                        }
+                        Ok(accepted)
+                    }
+                },
+            )?;
+            self.inner.lock().await.claim_manager = Some(participant.clone());
+            let ready = self
+                .starting_step(participant.wait_for(
+                    |state| matches!(state.phase, Phase::Ready | Phase::Terminal | Phase::Closed),
+                    None,
+                ))
+                .await?;
+            if ready.phase != Phase::Ready {
+                return Err(Error::StateUnavailable(
+                    "hardware participation bootstrap failed".into(),
+                ));
+            }
+            self.lifecycle.claims_ready.store(true, Ordering::SeqCst);
+            self.starting_step(self.reconcile_claims("startup")).await?;
+            let content = self.discovery.desired.borrow().content.clone();
+            let publication = {
+                let mut slot = self
+                    .discovery
+                    .publication
+                    .lock()
+                    .expect("hardware publication lock poisoned");
+                if self.discovery.stop.is_cancelled() {
+                    return Err(Error::Closed("hardware startup stopped".into()));
+                }
+                let publication = advertiser
+                    .payload(content.payload.clone().unwrap_or(Value::Null))
+                    .manage()?;
+                *slot = Some(publication.clone());
+                publication
+            };
             let runtime = self.clone();
-            self.spawn_worker(tasks, async move { runtime.hardware_command_loop().await });
+            self.spawn_worker(tasks, async move {
+                runtime.hardware_command_loop(messages).await
+            })?;
             let runtime = self.clone();
-            self.spawn_worker(tasks, async move { runtime.beacon_refresh_loop().await });
+            self.spawn_worker(tasks, async move { runtime.discovery_update_loop().await })?;
             let runtime = self.clone();
-            self.spawn_worker(tasks, async move { runtime.concord_watch_loop().await });
+            self.spawn_worker(tasks, async move { runtime.concord_watch_loop().await })?;
             let runtime = self.clone();
-            self.spawn_worker(
-                tasks,
-                async move { runtime.concord_token_refresh_loop().await },
-            );
-            let runtime = self.clone();
-            self.spawn_worker(
-                tasks,
-                async move { runtime.periodic_reconcile_loop().await },
-            );
+            self.spawn_worker(tasks, async move { runtime.state_watch_loop().await })?;
+            publication
+                .wait_ready(Some(std::time::Duration::from_secs(5)))
+                .await?;
+            self.discovery.synchronize().await;
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                return Err(Error::Closed("hardware startup stopped".into()));
+            }
+            self.lifecycle.initialized.store(true, Ordering::SeqCst);
+            self.state().await;
             Ok(())
+        }
+
+        async fn starting_step<V>(&self, future: impl Future<Output = Result<V>>) -> Result<V> {
+            tokio::select! {
+                biased;
+                _ = self.discovery.stop.cancelled() => Err(Error::Closed("hardware startup stopped".into())),
+                result = time::timeout(std::time::Duration::from_secs(5), future) => result.map_err(|_| Error::Deadline("hardware startup step exceeded deadline".into()))?,
+            }
         }
 
         fn spawn_worker(
             &self,
             tasks: &mut JoinSet<Result<()>>,
             future: impl Future<Output = Result<()>> + Send + 'static,
-        ) {
+        ) -> Result<()> {
+            let mut workers = self.lifecycle.workers.lock().expect("worker lock poisoned");
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                return Err(Error::Closed("hardware startup stopped".into()));
+            }
             self.lifecycle.active.fetch_add(1, Ordering::SeqCst);
             let guard = WorkerGuard(self.lifecycle.clone());
             let runtime = self.clone();
             let handle = tasks.spawn(async move {
-                let result = future.await;
+                let result = std::panic::AssertUnwindSafe(future)
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Error::StateUnavailable("hardware worker panicked".into()))
+                    });
                 drop(guard);
-                if result.is_err() {
+                if let Err(error) = &result {
+                    runtime.record_failure("hardware worker", error);
                     runtime.lifecycle.closed.store(true, Ordering::SeqCst);
-                    runtime.sources.close_sources();
                     tokio::spawn(async move {
                         let _ = runtime.stop().await;
                     });
                 }
                 result
             });
-            self.lifecycle
-                .workers
-                .lock()
-                .expect("worker lock poisoned")
-                .push(handle);
+            workers.push(handle);
+            Ok(())
         }
 
         pub async fn stop(&self) -> Result<()> {
             self.lifecycle.closed.store(true, Ordering::SeqCst);
+            self.discovery.request_close();
+            self.state().await;
             for worker in self
                 .lifecycle
                 .workers
@@ -886,122 +1309,376 @@ pub mod runtime {
             {
                 worker.abort();
             }
-            let runtime = self.clone();
-            // The bounded cleanup owns its lifetime even if the caller is cancelled.
-            tokio::spawn(async move {
-                let result = time::timeout(std::time::Duration::from_secs(5), async {
-                    loop {
-                        let changed = runtime.lifecycle.changed.notified();
-                        tokio::pin!(changed);
-                        changed.as_mut().enable();
-                        if runtime.lifecycle.active.load(Ordering::SeqCst) == 0 {
-                            break;
+            let mut completed = self.lifecycle.cleanup_status.subscribe();
+            if !self.lifecycle.cleanup_started.swap(true, Ordering::SeqCst) {
+                let runtime = self.clone();
+                // One cleanup task serves every close caller and survives
+                // cancellation of any caller waiting for it.
+                tokio::spawn(async move {
+                    let result = time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let changed = runtime.lifecycle.changed.notified();
+                            tokio::pin!(changed);
+                            changed.as_mut().enable();
+                            if runtime.lifecycle.active.load(Ordering::SeqCst) == 0 {
+                                break;
+                            }
+                            changed.await;
                         }
-                        changed.await;
+                        runtime.stop_inner().await
+                    })
+                    .await
+                    .map_err(|_| Error::Deadline("hardware cleanup deadline exceeded".into()))
+                    .and_then(|result| result);
+                    if runtime.owns_sources {
+                        runtime.sources.close_sources_and_wait().await;
                     }
-                    runtime.stop_inner().await
-                })
-                .await
-                .map_err(|_| Error::StateUnavailable("hardware cleanup deadline exceeded".into()))
-                .and_then(|result| result);
-                runtime.sources.close_sources_and_wait().await;
-                result
-            })
-            .await
-            .map_err(|error| Error::StateUnavailable(format!("hardware cleanup failed: {error}")))?
+                    if let Err(error) = &result {
+                        runtime.record_failure("hardware cleanup", error);
+                    }
+                    runtime
+                        .lifecycle
+                        .cleanup_status
+                        .send_replace(Some(result.map_err(|error| error.to_string())));
+                    runtime.state().await;
+                });
+            }
+            loop {
+                let result = completed.borrow_and_update().clone();
+                if let Some(result) = result {
+                    self.state().await;
+                    return result.map_err(Error::StateUnavailable);
+                }
+                completed
+                    .changed()
+                    .await
+                    .map_err(|_| Error::Closed("hardware cleanup channel closed".into()))?;
+            }
         }
 
         async fn stop_inner(&self) -> Result<()> {
-            let mut inner = self.inner.lock().await;
-            inner.closed = true;
-            inner.state.routing = HardwareClaimRouting::default();
-            inner.claim_manager.revoke_lost_authority();
-            let managed_keys = inner.claim_manager.owned_contract_keys();
-            let mut failure = None;
-            for key in managed_keys {
-                if let Err(error) = inner.claim_manager.release_withdraw(&key).await {
-                    failure = Some(error);
+            let participant = {
+                let mut inner = self.inner.lock().await;
+                if inner.closed {
+                    return Ok(());
                 }
+                inner.closed = true;
+                inner.state.routing = HardwareClaimRouting::default();
+                inner.claim_manager.clone()
+            };
+            if let Some(participant) = &participant {
+                for member in participant.state().value.contracts.values() {
+                    if let Some(contract) = &member.value.contract {
+                        let pointer = ContractPointer {
+                            contract_id: contract.contract_id.clone(),
+                            generation: contract.generation,
+                        };
+                        if let Some(context) = participant.agreement(&pointer) {
+                            context.request_withdraw();
+                        }
+                    }
+                }
+                participant.request_close();
             }
-            if let Err(error) = inner.withdraw_advertisement().await {
-                failure = Some(error);
-            }
-            failure.map_or(Ok(()), Err)
+            let publication = self.discovery.publication();
+            let withdrawal = async {
+                if let Some(publication) = publication {
+                    publication.close().await?;
+                }
+                Ok::<_, Error>(())
+            };
+            let claims = async {
+                if let Some(participant) = participant {
+                    participant.close().await?;
+                }
+                Ok::<_, Error>(())
+            };
+            let (claims, discovery) = futures_util::future::join(claims, withdrawal).await;
+            claims.and(discovery)
         }
 
         pub async fn set_device(&self, descriptor: DeviceDescriptor) -> Result<()> {
+            // Compile outside the authority lock. No schema or raster work
+            // should delay revocation or inventory updates for other devices.
+            let candidate = descriptor.clone();
+            let schemas = self.schemas.clone();
+            let validated = Arc::new(
+                tokio::task::spawn_blocking(move || ValidatedDevice::new(candidate, &schemas))
+                    .await
+                    .map_err(|error| {
+                        Error::StateUnavailable(format!(
+                            "descriptor validation worker failed: {error}"
+                        ))
+                    })??,
+            );
             let device_id = descriptor.device_id.clone();
-            let replaced_claim_keys = {
+            let (terminations, devices_to_reset, reset_handler) = {
                 let mut inner = self.inner.lock().await;
+                if self.lifecycle.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Closed("hardware runtime closed".into()));
+                }
                 let replaced = inner
                     .state
                     .devices()
                     .get(&device_id)
-                    .is_some_and(|current| current.fingerprint != descriptor.fingerprint);
+                    .is_some_and(|current| material_descriptor_change(current, &descriptor));
                 let replaced_claim_keys = if replaced {
                     inner.claim_keys_for_device(&device_id)
                 } else {
                     BTreeSet::new()
                 };
-                inner.state.set_device(descriptor)?;
-                replaced_claim_keys
+                let (terminations, reset_devices) = inner.terminate_claims(
+                    &replaced_claim_keys,
+                    &format!("hardware device {device_id} replaced"),
+                );
+                inner.state.set_device(descriptor);
+                inner.validated_devices.insert(device_id.clone(), validated);
+                inner.refresh_discovery()?;
+                if let Some(participant) = &inner.claim_manager {
+                    participant.wake_policy();
+                }
+                (terminations, reset_devices, inner.reset_handler.clone())
             };
-            self.cancel_contract_keys(
-                replaced_claim_keys,
-                &format!("hardware device {device_id} replaced"),
+            self.state().await;
+            let (cleanup, reset) = futures_util::future::join(
+                cleanup_claims(
+                    terminations,
+                    format!("hardware device {device_id} replaced"),
+                ),
+                reset_devices(reset_handler, &devices_to_reset),
             )
-            .await?;
-            self.reconcile_claims("device inventory").await?;
-            Ok(())
+            .await;
+            if self.lifecycle.claims_ready.load(Ordering::SeqCst) {
+                self.reconcile_claims("device inventory").await?;
+            }
+            self.discovery.synchronize().await;
+            self.state().await;
+            cleanup.and(reset)
         }
 
         pub async fn remove_device(&self, device_id: &str, reason: &str) -> Result<()> {
-            let claim_keys = {
+            let terminations = {
                 let mut inner = self.inner.lock().await;
+                if self.lifecycle.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Closed("hardware runtime closed".into()));
+                }
                 let claim_keys = inner.claim_keys_for_device(device_id);
+                let (terminations, _) = inner.terminate_claims(
+                    &claim_keys,
+                    &format!("hardware device {device_id} {reason}"),
+                );
                 inner.state.remove_device(device_id);
-                inner.publish_advertisement_if_changed(false).await?;
-                claim_keys
+                inner.validated_devices.remove(device_id);
+                inner.refresh_discovery()?;
+                if let Some(participant) = &inner.claim_manager {
+                    participant.wake_policy();
+                }
+                terminations
             };
-            self.cancel_contract_keys(claim_keys, &format!("hardware device {device_id} {reason}"))
-                .await?;
-            self.reconcile_claims("device inventory").await?;
-            Ok(())
+            self.state().await;
+            let cleanup = cleanup_claims(
+                terminations,
+                format!("hardware device {device_id} {reason}"),
+            )
+            .await;
+            if self.lifecycle.claims_ready.load(Ordering::SeqCst) {
+                self.reconcile_claims("device inventory").await?;
+            }
+            self.discovery.synchronize().await;
+            self.state().await;
+            cleanup
+        }
+
+        fn record_failure(&self, operation: &str, error: &Error) {
+            let mut failure = self
+                .lifecycle
+                .failure
+                .lock()
+                .expect("hardware failure lock poisoned");
+            // Preserve the original worker/startup failure when cleanup also fails.
+            if failure.is_none() {
+                *failure = Some(Failure::from_error(operation, error));
+            }
+        }
+
+        /// Immutable cached state. This never performs store or transport I/O.
+        pub async fn state(&self) -> Snapshot<HardwareRuntimeState> {
+            let inner = self.inner.lock().await;
+            let participation = inner.claim_manager.as_ref().map(ManagedParticipant::state);
+            let discovery = self
+                .discovery
+                .publication()
+                .map(|publication| publication.state());
+            let mut diagnostics = inner.diagnostics.clone();
+            diagnostics.discovery_error = discovery
+                .as_ref()
+                .and_then(|state| state.failure.as_ref())
+                .map(|failure| failure.detail.clone());
+            let value = HardwareRuntimeState {
+                endpoint: inner.state.endpoint().clone(),
+                session_id: inner.state.session_id().to_string(),
+                devices: inner.state.devices().clone(),
+                participation,
+                discovery,
+                diagnostics,
+            };
+            let closing = self.lifecycle.closed.load(Ordering::SeqCst);
+            let closed = self.lifecycle.cleanup_status.borrow().is_some();
+            let current = !closing
+                && value
+                    .participation
+                    .as_ref()
+                    .is_some_and(|state| state.current)
+                && value.discovery.as_ref().is_some_and(|state| state.current);
+            let ready = current
+                && value
+                    .participation
+                    .as_ref()
+                    .is_some_and(|state| state.phase == Phase::Ready)
+                && value
+                    .discovery
+                    .as_ref()
+                    .is_some_and(|state| state.phase == Phase::Ready);
+            let phase = if closed {
+                Phase::Closed
+            } else if closing {
+                Phase::Closing
+            } else if !self.lifecycle.initialized.load(Ordering::SeqCst) {
+                Phase::Starting
+            } else if ready {
+                Phase::Ready
+            } else {
+                Phase::Unavailable
+            };
+            let failure = self
+                .lifecycle
+                .failure
+                .lock()
+                .expect("hardware failure lock poisoned")
+                .clone()
+                .or_else(|| {
+                    value
+                        .participation
+                        .as_ref()
+                        .and_then(|state| state.failure.clone())
+                })
+                .or_else(|| {
+                    value
+                        .discovery
+                        .as_ref()
+                        .and_then(|state| state.failure.clone())
+                });
+            self.observed.modify(|snapshot| {
+                if snapshot.phase == phase
+                    && snapshot.current == current
+                    && snapshot.value == value
+                    && snapshot.failure == failure
+                {
+                    return false;
+                }
+                snapshot.changed = snapshot
+                    .value
+                    .devices
+                    .keys()
+                    .chain(value.devices.keys())
+                    .cloned()
+                    .collect();
+                for participation in [
+                    snapshot.value.participation.as_ref(),
+                    value.participation.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    snapshot
+                        .changed
+                        .extend(participation.value.contracts.keys().cloned());
+                }
+                snapshot.phase = phase;
+                snapshot.current = current;
+                snapshot.value = value;
+                snapshot.failure = failure;
+                true
+            });
+            self.observed.snapshot()
+        }
+
+        /// A bounded subscription that starts with the complete current state.
+        pub async fn watch_state(&self) -> Result<StateWatch<HardwareRuntimeState>> {
+            self.state().await;
+            self.observed.watch()
+        }
+
+        pub async fn wait_for(
+            &self,
+            predicate: impl FnMut(&Snapshot<HardwareRuntimeState>) -> bool,
+            timeout: Option<std::time::Duration>,
+        ) -> Result<Snapshot<HardwareRuntimeState>> {
+            self.state().await;
+            self.observed
+                .wait_for(predicate, timeout, self.sources.runtime_clock().as_ref())
+                .await
+        }
+
+        pub async fn diagnostics(&self) -> HardwareManagerDiagnostics {
+            self.state().await.value.diagnostics
         }
 
         pub async fn handle_hardware_message(&self, body: HardwareMessageBody) -> Result<()> {
             if self.lifecycle.closed.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let (message, lane) = {
-                let mut inner = self.inner.lock().await;
+            let (message, lane, validated, context) = {
+                let inner = self.inner.lock().await;
                 let claim_key = inner
                     .state
                     .routing
                     .claims
                     .get(&body.device_ref().device_id)
                     .map(|route| route.contract_key.clone());
-                if !claim_key.is_some_and(|key| inner.claim_manager.has_current_authority(&key)) {
+                if !claim_key.is_some_and(|key| inner.has_current_authority(&key)) {
                     return Ok(());
                 }
+                let Some(validated) = inner
+                    .validated_devices
+                    .get(&body.device_ref().device_id)
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                let route = &inner.state.routing.claims[&body.device_ref().device_id];
+                let Some(context) = inner.agreement(&route.contract_key) else {
+                    return Ok(());
+                };
                 (
                     inner.state.route_hardware_message(body)?,
                     inner.lane.clone(),
+                    validated,
+                    context,
                 )
             };
-            if let Some(message) = message {
+            if let Some(mut message) = message {
+                validate_operation(validated, message.hardware_body()?).await?;
+                if self.lifecycle.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Closed("hardware manager closed".into()));
+                }
+                context.authorize()?;
+                message.created_at = context.utc_now().to_rfc3339();
                 lane.publish_hardware_message(message).await?;
             }
             Ok(())
         }
 
-        async fn handle_command(&self, envelope: DeckrMessage) -> Result<()> {
+        async fn handle_command(&self, delivery: Delivery) -> Result<()> {
+            let envelope = &delivery.message;
             if self.lifecycle.closed.load(Ordering::SeqCst) {
                 return Ok(());
             }
             let mut decision = {
                 let inner = self.inner.lock().await;
-                inner.state.authorize_command(envelope.clone())?
+                inner
+                    .state
+                    .authorize_command(envelope.clone(), inner.concord.runtime_clock().utc_now())?
             };
             if matches!(
                 decision,
@@ -1013,14 +1690,17 @@ pub mod runtime {
                 self.reconcile_claims("command authorization").await?;
                 decision = {
                     let inner = self.inner.lock().await;
-                    inner.state.authorize_command(envelope.clone())?
+                    inner.state.authorize_command(
+                        envelope.clone(),
+                        inner.concord.runtime_clock().utc_now(),
+                    )?
                 };
             }
 
             match decision {
                 HardwareCommandDecision::Authorized => {
-                    let handler = {
-                        let mut inner = self.inner.lock().await;
+                    let (handler, validated, context, lane) = {
+                        let inner = self.inner.lock().await;
                         let Some(pointer) = &envelope.contract else {
                             return Ok(());
                         };
@@ -1029,22 +1709,127 @@ pub mod runtime {
                             pointer.generation,
                         );
                         if self.lifecycle.closed.load(Ordering::SeqCst)
-                            || !inner.claim_manager.has_current_authority(&key)
+                            || !inner.has_current_authority(&key)
                         {
                             return Ok(());
                         }
-                        inner.command_handler.clone()
+                        let body = envelope.hardware_body()?;
+                        let Some(validated) = inner
+                            .validated_devices
+                            .get(&body.device_ref().device_id)
+                            .cloned()
+                        else {
+                            return Ok(());
+                        };
+                        let Some(context) = inner.agreement(&key) else {
+                            return Ok(());
+                        };
+                        (
+                            inner.command_handler.clone(),
+                            validated,
+                            context,
+                            inner.lane.clone(),
+                        )
                     };
-                    let outcome = handler.handle_hardware_command(envelope.clone()).await?;
-                    self.publish_command_outcome(envelope, outcome).await
+                    if let Err(error) =
+                        validate_operation(validated.clone(), envelope.hardware_body()?).await
+                    {
+                        let outcome = match &error {
+                            Error::Unsupported(_) => HardwareCommandOutcome::Unsupported,
+                            Error::Unauthorized(_) => HardwareCommandOutcome::Stale,
+                            _ => HardwareCommandOutcome::Rejected,
+                        };
+                        {
+                            let mut inner = self.inner.lock().await;
+                            inner.diagnostics.rejected_messages =
+                                inner.diagnostics.rejected_messages.saturating_add(1);
+                            inner.diagnostics.last_message_error = Some(error.to_string());
+                        }
+                        self.state().await;
+                        return self.publish_command_outcome(&delivery, outcome).await;
+                    }
+                    context.authorize()?;
+                    let response_session = context.session().id().to_string();
+                    let lifecycle = self.lifecycle.clone();
+                    let request = envelope.clone();
+                    let authority: Arc<dyn Fn() -> Result<()> + Send + Sync> =
+                        Arc::new(move || {
+                            if lifecycle.closed.load(Ordering::SeqCst) {
+                                return Err(Error::Closed("hardware manager closed".into()));
+                            }
+                            if request.is_expired_at(context.utc_now()) {
+                                return Err(Error::Unauthorized("hardware request expired".into()));
+                            }
+                            context.authorize()
+                        });
+                    let response_device = validated.clone();
+                    let response_clock = self.sources.runtime_clock();
+                    let response_authority = authority.clone();
+                    let response_delivery = delivery.clone();
+                    let reply: HardwareReply = Arc::new(move |body| {
+                        let lane = lane.clone();
+                        let device = response_device.clone();
+                        let authorize = response_authority.clone();
+                        let delivery = response_delivery.clone();
+                        let session_id = response_session.clone();
+                        let clock = response_clock.clone();
+                        Box::pin(async move {
+                            authorize()?;
+                            let request = delivery.message.hardware_body()?;
+                            super::validation::validate_reply(&request, &body)?;
+                            validate_operation(device, body.clone()).await?;
+                            authorize()?;
+                            let device_ref = body.device_ref().clone();
+                            let mut reply = DeckrMessage::hardware_input_to(
+                                &device_ref.manager_id,
+                                &session_id,
+                                &device_ref.device_id,
+                                &delivery.message.sender,
+                                &delivery.message.sender_session_id,
+                                delivery.message.contract.clone().ok_or_else(|| {
+                                    Error::Unauthorized("hardware request lacks contract".into())
+                                })?,
+                                body,
+                            )?;
+                            reply.in_reply_to = Some(delivery.message.message_id.clone());
+                            publish_hardware_response(
+                                &lane,
+                                reply,
+                                delivery.reply_address,
+                                clock.as_ref(),
+                            )
+                            .await?;
+                            authorize()
+                        })
+                    });
+                    let driver_context = HardwareCommandContext {
+                        message: envelope.clone(),
+                        device: validated,
+                        authority,
+                        reply,
+                    };
+                    let outcome = handler
+                        .handle_authorized_hardware_command(driver_context.clone())
+                        .await?;
+                    driver_context.authorize()?;
+                    self.publish_command_outcome(&delivery, outcome).await
                 }
                 HardwareCommandDecision::Rejected { reply, .. } => {
-                    if let Some(reply) = reply {
+                    if let Some(mut reply) = reply {
                         let lane = {
                             let inner = self.inner.lock().await;
                             inner.lane.clone()
                         };
-                        lane.publish_hardware_message(*reply).await?;
+                        reply.in_reply_to = Some(envelope.message_id.clone());
+                        if !envelope.is_expired_at(self.sources.runtime_clock().utc_now()) {
+                            publish_hardware_response(
+                                &lane,
+                                *reply,
+                                delivery.reply_address,
+                                self.sources.runtime_clock().as_ref(),
+                            )
+                            .await?;
+                        }
                     }
                     Ok(())
                 }
@@ -1060,57 +1845,27 @@ pub mod runtime {
                         reset_devices: BTreeSet::new(),
                     });
                 }
-                let state_snapshot = inner.state.clone();
-                let mut selected_devices = state_snapshot.routing.claimed_device_ids();
-                let managed = inner
-                    .claim_manager
-                    .reconcile_cached(
-                        |contract, record| {
-                            if !state_snapshot.accept_current_hardware_claim(contract, record)? {
-                                return Ok(false);
-                            }
-                            let Some(terms_value) = record.terms.clone() else {
-                                return Ok(false);
-                            };
-                            let terms = HardwareClaimTerms::from_value(terms_value)?;
-                            let device_ids = terms
-                                .devices
-                                .iter()
-                                .map(|device| device.device_ref.device_id.clone())
-                                .collect::<BTreeSet<_>>();
-                            if state_snapshot
-                                .routing
-                                .route_for_contract(&contract.key)
-                                .is_some()
-                            {
-                                selected_devices.extend(device_ids);
-                                return Ok(true);
-                            }
-                            if device_ids
-                                .iter()
-                                .any(|device_id| selected_devices.contains(device_id))
-                            {
-                                return Ok(false);
-                            }
-                            selected_devices.extend(device_ids);
-                            Ok(true)
-                        },
-                        None,
-                    )
-                    .await?;
+                let managed = inner.managed_claims();
                 let reconcile = inner.state.reconcile_claims(&managed);
-                inner.publish_advertisement_if_changed(false).await?;
+                inner.refresh_discovery()?;
                 (reconcile, inner.reset_handler.clone())
             };
+            self.state().await;
             reset_devices(reset_handler, &reconcile.reset_devices).await?;
             Ok(reconcile)
         }
 
         async fn publish_command_outcome(
             &self,
-            envelope: DeckrMessage,
+            delivery: &Delivery,
             outcome: HardwareCommandOutcome,
         ) -> Result<()> {
+            let envelope = &delivery.message;
+            if envelope.is_expired_at(self.sources.runtime_clock().utc_now())
+                || self.lifecycle.closed.load(Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             let Some(reason) = outcome.rejection() else {
                 return Ok(());
             };
@@ -1126,187 +1881,119 @@ pub mod runtime {
                     reason,
                 )?
             };
-            if let Some(reply) = reply {
+            if let Some(mut reply) = reply {
                 let lane = {
                     let inner = self.inner.lock().await;
                     inner.lane.clone()
                 };
-                lane.publish_hardware_message(reply).await?;
-            }
-            Ok(())
-        }
-
-        async fn cancel_contract_keys(
-            &self,
-            contract_keys: BTreeSet<String>,
-            reason: &str,
-        ) -> Result<()> {
-            if contract_keys.is_empty() {
-                return Ok(());
-            }
-            let mut inner = self.inner.lock().await;
-            let contracts = inner.claim_manager.managed_contracts();
-            for managed in contracts {
-                if !contract_keys.contains(&managed.contract.key) {
-                    continue;
-                }
-                inner
-                    .claim_manager
-                    .cancel(&managed.contract, Some(reason.to_string()))
-                    .await?;
-                inner
-                    .claim_manager
-                    .release_withdraw(&managed.contract.key)
-                    .await?;
-            }
-            Ok(())
-        }
-
-        async fn reconcile_notification(
-            &self,
-            notification: &ConcordContractNotification,
-        ) -> Result<HardwareClaimReconcile> {
-            let (reconcile, reset_handler) = {
-                let mut inner = self.inner.lock().await;
-                if inner.closed {
-                    return Ok(HardwareClaimReconcile {
-                        reset_devices: BTreeSet::new(),
-                    });
-                }
-                let state_snapshot = inner.state.clone();
-                let mut selected_devices = state_snapshot.routing.claimed_device_ids();
-                let managed = inner
-                    .claim_manager
-                    .reconcile_notification_cached(
-                        notification,
-                        |contract, record| {
-                            if !state_snapshot.accept_current_hardware_claim(contract, record)? {
-                                return Ok(false);
-                            }
-                            let Some(terms_value) = record.terms.clone() else {
-                                return Ok(false);
-                            };
-                            let terms = HardwareClaimTerms::from_value(terms_value)?;
-                            let device_ids = terms
-                                .devices
-                                .iter()
-                                .map(|device| device.device_ref.device_id.clone())
-                                .collect::<BTreeSet<_>>();
-                            if state_snapshot
-                                .routing
-                                .route_for_contract(&contract.key)
-                                .is_some()
-                            {
-                                selected_devices.extend(device_ids);
-                                return Ok(true);
-                            }
-                            if device_ids
-                                .iter()
-                                .any(|device_id| selected_devices.contains(device_id))
-                            {
-                                return Ok(false);
-                            }
-                            selected_devices.extend(device_ids);
-                            Ok(true)
-                        },
-                        None,
+                reply.in_reply_to = Some(envelope.message_id.clone());
+                if !envelope.is_expired_at(self.sources.runtime_clock().utc_now()) {
+                    publish_hardware_response(
+                        &lane,
+                        reply,
+                        delivery.reply_address.clone(),
+                        self.sources.runtime_clock().as_ref(),
                     )
                     .await?;
-                let reconcile = inner.state.reconcile_claims(&managed);
-                inner.publish_advertisement_if_changed(false).await?;
-                (reconcile, inner.reset_handler.clone())
-            };
-            reset_devices(reset_handler, &reconcile.reset_devices).await?;
-            Ok(reconcile)
-        }
-
-        async fn refresh_managed_tokens(&self) -> Result<()> {
-            let (reconcile, reset_handler) = {
-                let mut inner = self.inner.lock().await;
-                if inner.closed {
-                    return Ok(());
                 }
-                let managed = inner.claim_manager.reconcile_managed_cached(None).await?;
-                let reconcile = inner.state.reconcile_claims(&managed);
-                inner.publish_advertisement_if_changed(false).await?;
-                (reconcile, inner.reset_handler.clone())
-            };
-            reset_devices(reset_handler, &reconcile.reset_devices).await
-        }
-
-        async fn hardware_command_loop(&self) -> Result<()> {
-            let (endpoint, lane) = {
-                let inner = self.inner.lock().await;
-                (inner.state.endpoint().clone(), inner.lane.clone())
-            };
-            let mut messages = lane.subscribe_hardware_messages(&endpoint).await?;
-            while let Some(message) = messages.next().await {
-                self.handle_command(message?).await?;
             }
             Ok(())
         }
 
-        async fn beacon_refresh_loop(&self) -> Result<()> {
-            loop {
-                let interval = {
-                    let inner = self.inner.lock().await;
-                    if inner.closed {
-                        return Ok(());
-                    }
-                    inner.maintenance_policy.renewal_interval
+        async fn hardware_command_loop(&self, mut messages: DeliveryStream) -> Result<()> {
+            while let Some(message) = messages.next().await {
+                let result = match message {
+                    Ok(message) => self.handle_command(message).await,
+                    Err(error) => Err(error),
                 };
-                time::sleep(interval).await;
-                let mut inner = self.inner.lock().await;
-                if inner.closed {
-                    return Ok(());
+                match result {
+                    Ok(()) => {}
+                    Err(
+                        error @ (Error::Invalid(_)
+                        | Error::Json(_)
+                        | Error::Unauthorized(_)
+                        | Error::Unsupported(_)),
+                    ) => {
+                        let mut inner = self.inner.lock().await;
+                        inner.diagnostics.rejected_messages =
+                            inner.diagnostics.rejected_messages.saturating_add(1);
+                        inner.diagnostics.last_message_error = Some(error.to_string());
+                        drop(inner);
+                        self.state().await;
+                    }
+                    Err(error) => return Err(error),
                 }
-                inner.publish_advertisement_if_changed(true).await?;
+            }
+            Err(Error::Closed("hardware message subscription ended".into()))
+        }
+
+        async fn discovery_update_loop(&self) -> Result<()> {
+            let publication = self
+                .discovery
+                .publication()
+                .ok_or_else(|| Error::Invalid("hardware publication not started".into()))?;
+            let mut desired = self.discovery.desired.subscribe();
+            loop {
+                let intent = desired.borrow_and_update().clone();
+                // Managed Beacon retries transient failures and owns its TTL
+                // schedule. Errors here affect discovery diagnostics only.
+                let _ = publication.update(intent.content).await;
+                self.discovery.attempted.send_replace(Some(intent.version));
+                tokio::select! {
+                    _ = self.discovery.stop.cancelled() => return Ok(()),
+                    changed = desired.changed() => { if changed.is_err() { return Ok(()); } },
+                }
             }
         }
 
         async fn concord_watch_loop(&self) -> Result<()> {
-            let mut notifications = {
-                let inner = self.inner.lock().await;
-                inner
-                    .concord
-                    .watch_contract_notifications_cached(
-                        Some(HARDWARE_CLAIM_PROFILE_ID),
-                        Some(inner.state.endpoint()),
-                    )
-                    .await?
-            };
-            loop {
-                let notification = notifications.next().await?;
-                self.reconcile_notification(&notification).await?;
+            let participant = self
+                .inner
+                .lock()
+                .await
+                .claim_manager
+                .clone()
+                .ok_or_else(|| Error::Invalid("hardware participation not started".into()))?;
+            let mut states = participant.watch_state()?;
+            while let Some(state) = states.next().await {
+                self.reconcile_claims("managed participation").await?;
+                if state.phase == Phase::Closed {
+                    break;
+                }
+            }
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Error::Closed("hardware participation ended".into()))
             }
         }
 
-        async fn concord_token_refresh_loop(&self) -> Result<()> {
-            loop {
-                let interval = {
-                    let inner = self.inner.lock().await;
-                    if inner.closed {
-                        return Ok(());
-                    }
-                    inner.maintenance_policy.concord_token_check_interval()
-                };
-                time::sleep(interval).await;
-                self.refresh_managed_tokens().await?;
+        async fn state_watch_loop(&self) -> Result<()> {
+            let publication = self
+                .discovery
+                .publication()
+                .ok_or_else(|| Error::Invalid("hardware publication not started".into()))?;
+            let participant = self
+                .inner
+                .lock()
+                .await
+                .claim_manager
+                .clone()
+                .ok_or_else(|| Error::Invalid("hardware participation not started".into()))?;
+            let mut discovery = publication.watch_state()?;
+            let mut participation = participant.watch_state()?;
+            let mut discovery_open = true;
+            let mut participation_open = true;
+            while discovery_open || participation_open {
+                // Observability is independent of device-reset callbacks in
+                // the routing worker, and never polls or scans either store.
+                tokio::select! {
+                    next = discovery.next(), if discovery_open => discovery_open = next.is_some(),
+                    next = participation.next(), if participation_open => participation_open = next.is_some(),
+                }
+                self.state().await;
             }
-        }
-
-        async fn periodic_reconcile_loop(&self) -> Result<()> {
-            loop {
-                let interval = {
-                    let inner = self.inner.lock().await;
-                    if inner.closed {
-                        return Ok(());
-                    }
-                    inner.maintenance_policy.reconcile_interval
-                };
-                time::sleep(interval).await;
-                self.reconcile_claims("periodic snapshot").await?;
-            }
+            Ok(())
         }
     }
 
@@ -1317,51 +2004,94 @@ pub mod runtime {
         T: StateStore,
         L: HardwareLaneTransport,
     {
-        fn claim_keys_for_device(&self, device_id: &str) -> BTreeSet<String> {
-            self.state
-                .routing
-                .claims
-                .get(device_id)
-                .map(|claim| BTreeSet::from([claim.contract_key.clone()]))
-                .unwrap_or_default()
+        fn terminate_claims(
+            &mut self,
+            keys: &BTreeSet<String>,
+            reason: &str,
+        ) -> (Vec<MaterializedTermination<C, T>>, BTreeSet<String>) {
+            let mut reset_devices = BTreeSet::new();
+            self.state.routing.claims.retain(|device_id, route| {
+                if keys.contains(&route.contract_key) {
+                    reset_devices.insert(device_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let terminations = keys
+                .iter()
+                .filter_map(|key| self.agreement(key))
+                .inspect(|context| context.request_close_with_reason(reason))
+                .collect();
+            (terminations, reset_devices)
         }
 
-        async fn publish_advertisement_if_changed(&mut self, force: bool) -> Result<bool> {
-            if self.closed {
-                return Ok(false);
-            }
-            let payload = self.advertisement_payload_value()?;
-            if !force
-                && self.advertisement_handle.is_some()
-                && self.advertised_payload.as_ref() == Some(&payload)
-            {
-                return Ok(false);
-            }
-            let advertiser = self.advertiser_for_payload(payload.clone());
-            let handle = advertiser
-                .publish_or_refresh(self.advertisement_handle.as_ref())
-                .await?;
-            self.advertisement_handle = Some(handle);
-            self.advertised_payload = Some(payload);
-            Ok(true)
+        fn refresh_discovery(&self) -> Result<()> {
+            self.discovery.update(AdvertisementContent {
+                payload: Some(self.advertisement_payload_value()?),
+                labels: self.state.labels.clone(),
+                ..Default::default()
+            });
+            Ok(())
         }
 
-        async fn cleanup_stale_advertisement(&self) -> Result<usize> {
-            let payload = self.advertisement_payload_value()?;
-            self.advertiser_for_payload(payload)
-                .cleanup_stale_same_endpoint()
-                .await
+        fn agreement(&self, key: &str) -> Option<AgreementContext<C, T>> {
+            let (contract_id, generation) = crate::keys::parse_concord_contract_key(key)?;
+            self.claim_manager.as_ref()?.agreement(&ContractPointer {
+                contract_id,
+                generation,
+            })
         }
 
-        async fn withdraw_advertisement(&mut self) -> Result<()> {
-            let Some(handle) = self.advertisement_handle.take() else {
-                return Ok(());
+        fn has_current_authority(&self, key: &str) -> bool {
+            self.agreement(key)
+                .is_some_and(|context| context.has_authority())
+        }
+
+        fn managed_claims(&self) -> Vec<ConcordManagedContract> {
+            let Some(participant) = &self.claim_manager else {
+                return Vec::new();
             };
-            let payload = self
-                .advertised_payload
-                .take()
-                .unwrap_or(Value::Object(Default::default()));
-            self.advertiser_for_payload(payload).withdraw(&handle).await
+            participant
+                .state()
+                .value
+                .contracts
+                .into_values()
+                .filter_map(|member| {
+                    if !member.value.local_authority {
+                        return None;
+                    }
+                    let validity = member.value.validity?;
+                    Some(ConcordManagedContract {
+                        record: validity.contract.clone()?,
+                        contract: member.value.contract?,
+                        validity,
+                        token: member.value.token,
+                    })
+                })
+                .collect()
+        }
+
+        fn claim_keys_for_device(&self, device_id: &str) -> BTreeSet<String> {
+            let Some(participant) = &self.claim_manager else {
+                return BTreeSet::new();
+            };
+            participant
+                .state()
+                .value
+                .contracts
+                .values()
+                .filter_map(|member| {
+                    let contract = member.value.contract.as_ref()?;
+                    let record = self.concord.contract_record_cached(contract).ok()??;
+                    let terms = HardwareClaimTerms::from_value(record.terms?).ok()?;
+                    terms
+                        .devices
+                        .iter()
+                        .any(|device| device.device_ref.device_id == device_id)
+                        .then_some(contract.key.clone())
+                })
+                .collect()
         }
 
         fn advertisement_payload_value(&self) -> Result<Value> {
@@ -1375,11 +2105,59 @@ pub mod runtime {
                 self.state.endpoint().clone(),
                 self.state.session_id().to_string(),
             )
+            .clock(self.concord.runtime_clock())
             .advertisement_id(self.advertisement_id.clone())
             .labels(self.state.labels.clone())
-            .refresh_interval(self.maintenance_policy.renewal_interval)
             .payload(payload)
         }
+    }
+
+    fn material_descriptor_change(current: &DeviceDescriptor, next: &DeviceDescriptor) -> bool {
+        let mut comparable = current.clone();
+        comparable.display_name.clone_from(&next.display_name);
+        &comparable != next
+    }
+
+    async fn validate_operation(
+        device: Arc<ValidatedDevice>,
+        message: HardwareMessageBody,
+    ) -> Result<()> {
+        // Image decoding and schema evaluation must not occupy the async
+        // scheduler responsible for the agreement's heartbeat deadline.
+        tokio::task::spawn_blocking(move || device.validate_message(&message))
+            .await
+            .map_err(|error| {
+                Error::StateUnavailable(format!("hardware validation worker failed: {error}"))
+            })?
+    }
+
+    async fn publish_hardware_response<L: HardwareLaneTransport>(
+        lane: &L,
+        mut reply: DeckrMessage,
+        route: Option<String>,
+        clock: &dyn Clock,
+    ) -> Result<()> {
+        reply.created_at = clock.utc_now().to_rfc3339();
+        reply.validate()?;
+        crate::lifecycle::deadline(
+            clock,
+            std::time::Duration::from_secs(5),
+            "hardware reply publication",
+            lane.publish_hardware_reply(reply, route),
+        )
+        .await
+    }
+
+    async fn cleanup_claims<C: StateStore, T: StateStore>(
+        terminations: Vec<MaterializedTermination<C, T>>,
+        _reason: String,
+    ) -> Result<()> {
+        for result in
+            futures_util::future::join_all(terminations.iter().map(|context| context.close())).await
+        {
+            result?;
+        }
+        Ok(())
     }
 
     async fn reset_devices(
@@ -1399,6 +2177,25 @@ pub mod runtime {
     impl HardwareLaneTransport for crate::nats::NatsDeckrRuntime {
         async fn publish_hardware_message(&self, message: DeckrMessage) -> Result<()> {
             self.publish(&message).await
+        }
+
+        async fn publish_hardware_reply(
+            &self,
+            message: DeckrMessage,
+            reply_address: Option<String>,
+        ) -> Result<()> {
+            self.message_transport()
+                .publish(&message, reply_address.as_deref(), None)
+                .await
+        }
+
+        async fn subscribe_hardware_deliveries<'a>(
+            &'a self,
+            endpoint: &'a EndpointAddress,
+        ) -> Result<DeliveryStream> {
+            self.message_transport()
+                .subscribe(crate::lanes::HARDWARE_MESSAGES_LANE, endpoint)
+                .await
         }
 
         async fn subscribe_hardware_messages<'a>(
@@ -1437,19 +2234,22 @@ pub mod runtime {
             reset_handler: Option<Arc<dyn HardwareResetHandler>>,
             maintenance_policy: StateMaintenancePolicy,
         ) -> Result<Self> {
-            Self::new(HardwareManagerRuntimeSpec {
-                manager_id: manager_id.into(),
-                session_id: session_id.into(),
-                labels,
-                beacon_state: runtime.beacon_advertisements().clone(),
-                concord_contract_state: runtime.concord_contracts().clone(),
-                concord_token_state: runtime.concord_tokens().clone(),
-                lane: runtime,
-                maintenance_policy,
-                command_handler,
-                reset_handler,
-            })
-            .await
+            let concord = runtime.materialized_concord().await?;
+            Self::with_concord(
+                HardwareManagerRuntimeSpec {
+                    manager_id: manager_id.into(),
+                    session_id: session_id.into(),
+                    labels,
+                    beacon_state: runtime.beacon_advertisements().clone(),
+                    concord_contract_state: runtime.concord_contracts().clone(),
+                    concord_token_state: runtime.concord_tokens().clone(),
+                    lane: runtime,
+                    maintenance_policy,
+                    command_handler,
+                    reset_handler,
+                },
+                concord,
+            )
         }
 
         pub async fn from_deckr_runtime(
@@ -1517,18 +2317,17 @@ pub mod runtime {
 
         fn state_with_device() -> HardwareManagerState {
             let mut state = HardwareManagerState::new("manager-main", "manager-session").unwrap();
-            state
-                .set_device(DeviceDescriptor {
-                    device_id: "deck".to_string(),
-                    fingerprint: "fingerprint:deck".to_string(),
-                    display_name: "Deck".to_string(),
-                    manufacturer: None,
-                    model: None,
-                    serial_number: None,
-                    controls: Vec::new(),
-                    capabilities: Vec::new(),
-                })
-                .unwrap();
+            state.set_device(DeviceDescriptor {
+                device_id: "deck".to_string(),
+                fingerprint: "fingerprint:deck".to_string(),
+                display_name: "Deck".to_string(),
+                manufacturer: None,
+                model: None,
+                serial_number: None,
+                controls: Vec::new(),
+                capabilities: Vec::new(),
+                ..Default::default()
+            });
             state
         }
 
@@ -1565,11 +2364,14 @@ pub mod runtime {
         fn command_authorization_marks_missing_cached_claim_refresh_needed() {
             let state = state_with_device();
             let decision = state
-                .authorize_command(command(
-                    "main",
-                    "controller-session",
-                    Some(contract_pointer("claim-a")),
-                ))
+                .authorize_command(
+                    command(
+                        "main",
+                        "controller-session",
+                        Some(contract_pointer("claim-a")),
+                    ),
+                    chrono::Utc::now(),
+                )
                 .unwrap();
 
             assert_unauthorized_refresh(decision, true);
@@ -1591,7 +2393,9 @@ pub mod runtime {
                 ),
                 command("main", "controller-session", None),
             ] {
-                let decision = state_with_claim().authorize_command(message).unwrap();
+                let decision = state_with_claim()
+                    .authorize_command(message, chrono::Utc::now())
+                    .unwrap();
                 assert_unauthorized_refresh(decision, false);
             }
         }

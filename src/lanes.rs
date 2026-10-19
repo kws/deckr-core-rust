@@ -18,6 +18,7 @@ pub const LANE_SUBJECT_PREFIX: &str = "deckr.msg";
 pub const HARDWARE_MESSAGES_LANE: &str = "hardware_messages";
 pub const HARDWARE_MESSAGES_SCHEMA_ID: &str = "dev.deckr.message.hardware_messages.v1";
 pub const DECKR_PROTOCOL_VERSION: &str = "1";
+pub const SERVICES_LANE: &str = "services";
 
 const JSON_SCHEMA_CONTRACT_KEYS: &[&str] = &[
     "$ref",
@@ -31,399 +32,11 @@ const JSON_SCHEMA_CONTRACT_KEYS: &[&str] = &[
     "type",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceRef {
-    pub manager_id: String,
-    pub device_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
-}
+mod descriptors;
+pub use descriptors::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ControlGeometry {
-    pub x: f64,
-    pub y: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub width: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub height: Option<f64>,
-    pub unit: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CapabilityConstraint {
-    #[serde(rename = "type")]
-    pub constraint_type: String,
-    pub subject: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub values: Vec<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimum: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maximum: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CapabilitySchema {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_id: Option<String>,
-    pub schema: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct CapabilityDescriptor {
-    pub capability_id: String,
-    pub family: String,
-    #[serde(rename = "type")]
-    pub capability_type: String,
-    pub direction: String,
-    pub access: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value_schema: Option<CapabilitySchema>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command_schema: Option<CapabilitySchema>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub constraints: Vec<CapabilityConstraint>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub event_types: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub command_types: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlDescriptor {
-    pub control_id: String,
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub geometry: Option<ControlGeometry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub input_capabilities: Vec<CapabilityDescriptor>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub output_capabilities: Vec<CapabilityDescriptor>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceDescriptor {
-    pub device_id: String,
-    pub fingerprint: String,
-    pub display_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub manufacturer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub serial_number: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub controls: Vec<ControlDescriptor>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<CapabilityDescriptor>,
-}
-
-impl DeviceRef {
-    pub fn validate(&self) -> Result<()> {
-        require_not_endpoint_address(&self.manager_id, "device reference")?;
-        require_not_endpoint_address(&self.device_id, "device reference")?;
-        if let Some(fingerprint) = &self.fingerprint {
-            require_non_empty(fingerprint, "fingerprint")?;
-        }
-        Ok(())
-    }
-}
-
-impl ControlGeometry {
-    pub fn validate(&self) -> Result<()> {
-        require_finite(self.x, "geometry value")?;
-        require_finite(self.y, "geometry value")?;
-        require_optional_positive_finite(self.width, "geometry width")?;
-        require_optional_positive_finite(self.height, "geometry height")?;
-        if !matches!(
-            self.unit.as_str(),
-            "grid" | "pixel" | "normalized" | "millimeter"
-        ) {
-            return Err(Error::Invalid(
-                "geometry unit must be grid, pixel, normalized, or millimeter".to_string(),
-            ));
-        }
-        if self.unit == "normalized" {
-            require_normalized(self.x, "normalized geometry x")?;
-            require_normalized(self.y, "normalized geometry y")?;
-            if let Some(width) = self.width {
-                require_normalized(width, "normalized geometry width")?;
-            }
-            if let Some(height) = self.height {
-                require_normalized(height, "normalized geometry height")?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl CapabilitySchema {
-    pub fn validate(&self) -> Result<()> {
-        if let Some(schema_id) = &self.schema_id {
-            require_globally_qualified_name(schema_id, "schema_id")?;
-        }
-        let Some(object) = self.schema.as_object() else {
-            return Err(Error::Invalid(
-                "capability schema must be a JSON object".to_string(),
-            ));
-        };
-        if object.is_empty() {
-            return Err(Error::Invalid(
-                "capability schema must not be empty".to_string(),
-            ));
-        }
-        if !JSON_SCHEMA_CONTRACT_KEYS
-            .iter()
-            .any(|key| object.contains_key(*key))
-        {
-            return Err(Error::Invalid(
-                "capability schema must include a JSON Schema contract keyword".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl CapabilityConstraint {
-    pub fn validate(&self) -> Result<()> {
-        require_contract_token(&self.constraint_type, "constraint type")?;
-        require_contract_token(&self.subject, "constraint subject")?;
-        if let Some(unit) = &self.unit {
-            require_contract_token(unit, "capability constraint unit")?;
-        }
-        if let Some(minimum) = self.minimum {
-            require_finite(minimum, "capability constraint number")?;
-        }
-        if let Some(maximum) = self.maximum {
-            require_finite(maximum, "capability constraint number")?;
-        }
-        if let Some(step) = self.step {
-            require_finite(step, "capability constraint number")?;
-            if step <= 0.0 {
-                return Err(Error::Invalid(
-                    "capability constraint step must be positive".to_string(),
-                ));
-            }
-        }
-        if let (Some(minimum), Some(maximum)) = (self.minimum, self.maximum) {
-            if minimum > maximum {
-                return Err(Error::Invalid(
-                    "capability constraint minimum must not exceed maximum".to_string(),
-                ));
-            }
-        }
-        if self.value.as_ref().is_none_or(Value::is_null)
-            && self.values.is_empty()
-            && self.minimum.is_none()
-            && self.maximum.is_none()
-            && self.step.is_none()
-        {
-            return Err(Error::Invalid(
-                "capability constraint must carry a bound or value".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl CapabilityDescriptor {
-    pub fn validate(&self) -> Result<()> {
-        require_contract_token(&self.capability_id, "capability_id")?;
-        require_globally_qualified_name(&self.family, "capability family")?;
-        validate_core_capability_family(&self.family)?;
-        require_contract_token(&self.capability_type, "capability type")?;
-        validate_capability_direction(&self.direction)?;
-        validate_access(&self.direction, &self.access)?;
-        if let Some(value_schema) = &self.value_schema {
-            value_schema.validate()?;
-        }
-        if let Some(command_schema) = &self.command_schema {
-            if !matches!(self.direction.as_str(), "output" | "command") {
-                return Err(Error::Invalid(
-                    "command schema is only valid on output or command capabilities".to_string(),
-                ));
-            }
-            command_schema.validate()?;
-        }
-        for constraint in &self.constraints {
-            constraint.validate()?;
-        }
-        validate_contract_token_list(&self.event_types, "event or command type")?;
-        validate_contract_token_list(&self.command_types, "event or command type")?;
-        if !self.event_types.is_empty() && !matches!(self.direction.as_str(), "input" | "state") {
-            return Err(Error::Invalid(
-                "event types are only valid on input or state capabilities".to_string(),
-            ));
-        }
-        if !self.command_types.is_empty()
-            && !matches!(self.direction.as_str(), "output" | "command")
-        {
-            return Err(Error::Invalid(
-                "command types are only valid on output or command capabilities".to_string(),
-            ));
-        }
-        self.validate_core_family_type()
-    }
-
-    fn validate_core_family_type(&self) -> Result<()> {
-        match self.family.as_str() {
-            "dev.deckr.input.button" => {
-                if !matches!(self.capability_type.as_str(), "activation" | "momentary") {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.button capability type must be activation or momentary"
-                            .to_string(),
-                    ));
-                }
-                if self.capability_type == "activation" && self.event_types != ["press"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.button activation capabilities emit press only"
-                            .to_string(),
-                    ));
-                }
-                if self.capability_type == "momentary" && self.event_types != ["down", "up"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.button momentary capabilities emit down and up"
-                            .to_string(),
-                    ));
-                }
-            }
-            "dev.deckr.input.encoder" => {
-                if self.capability_type != "relative" {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.encoder capability type must be relative".to_string(),
-                    ));
-                }
-                if self.event_types != ["rotate"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.encoder relative capabilities emit rotate".to_string(),
-                    ));
-                }
-            }
-            "dev.deckr.input.touch" => {
-                if self.capability_type != "gesture" {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.touch capability type must be gesture".to_string(),
-                    ));
-                }
-                if self.event_types != ["tap", "swipe"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.input.touch gesture capabilities emit tap and swipe".to_string(),
-                    ));
-                }
-            }
-            "dev.deckr.output.raster" => {
-                if self.capability_type != "bitmap" {
-                    return Err(Error::Invalid(
-                        "dev.deckr.output.raster capability type must be bitmap".to_string(),
-                    ));
-                }
-                if self.command_types != ["set_frame", "clear"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.output.raster bitmap capabilities support set_frame and clear"
-                            .to_string(),
-                    ));
-                }
-            }
-            "dev.deckr.device.power" => {
-                if self.capability_type != "screen" {
-                    return Err(Error::Invalid(
-                        "dev.deckr.device.power capability type must be screen".to_string(),
-                    ));
-                }
-                if self.command_types != ["sleep", "wake"] {
-                    return Err(Error::Invalid(
-                        "dev.deckr.device.power screen capabilities support sleep and wake"
-                            .to_string(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-impl ControlDescriptor {
-    pub fn validate(&self) -> Result<()> {
-        require_non_empty(&self.control_id, "control_id")?;
-        require_contract_token(&self.kind, "control kind")?;
-        if let Some(label) = &self.label {
-            require_non_empty(label, "control text")?;
-        }
-        if let Some(geometry) = &self.geometry {
-            geometry.validate()?;
-        }
-        let mut capability_ids = Vec::new();
-        for capability in &self.input_capabilities {
-            if capability.direction != "input" {
-                return Err(Error::Invalid(
-                    "input_capabilities must have input direction".to_string(),
-                ));
-            }
-            capability.validate()?;
-            capability_ids.push(capability.capability_id.clone());
-        }
-        for capability in &self.output_capabilities {
-            if capability.direction != "output" {
-                return Err(Error::Invalid(
-                    "output_capabilities must have output direction".to_string(),
-                ));
-            }
-            capability.validate()?;
-            capability_ids.push(capability.capability_id.clone());
-        }
-        require_unique(&capability_ids, "capability ids on control")?;
-        Ok(())
-    }
-}
-
-impl DeviceDescriptor {
-    pub fn validate(&self) -> Result<()> {
-        require_not_endpoint_address(&self.device_id, "device_id")?;
-        require_non_empty(&self.fingerprint, "device descriptor text")?;
-        require_non_empty(&self.display_name, "device descriptor text")?;
-        if let Some(manufacturer) = &self.manufacturer {
-            require_non_empty(manufacturer, "device descriptor text")?;
-        }
-        if let Some(model) = &self.model {
-            require_non_empty(model, "device descriptor text")?;
-        }
-        if let Some(serial_number) = &self.serial_number {
-            require_non_empty(serial_number, "device descriptor text")?;
-        }
-        let mut control_ids = Vec::new();
-        for control in &self.controls {
-            control.validate()?;
-            control_ids.push(control.control_id.clone());
-        }
-        require_unique(&control_ids, "control ids")?;
-        let mut capability_ids = Vec::new();
-        for capability in &self.capabilities {
-            capability.validate()?;
-            capability_ids.push(capability.capability_id.clone());
-        }
-        require_unique(&capability_ids, "device-level capability ids")?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "targetType")]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "targetType", deny_unknown_fields)]
 pub enum MessageTarget {
     #[serde(rename = "endpoint")]
     Endpoint { endpoint: String },
@@ -439,7 +52,65 @@ pub enum MessageTarget {
     },
 }
 
+impl<'de> Deserialize<'de> for MessageTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Target {
+            Endpoint {
+                #[serde(rename = "targetType", default = "endpoint_kind")]
+                target_type: String,
+                endpoint: String,
+            },
+            Broadcast {
+                #[serde(rename = "targetType", default = "broadcast_kind")]
+                target_type: String,
+                scope: String,
+                #[serde(rename = "endpointFamily")]
+                endpoint_family: String,
+                domain: Option<String>,
+                #[serde(rename = "hopLimit")]
+                hop_limit: Option<u32>,
+            },
+        }
+        fn endpoint_kind() -> String {
+            "endpoint".into()
+        }
+        fn broadcast_kind() -> String {
+            "broadcast".into()
+        }
+        match Target::deserialize(deserializer)? {
+            Target::Endpoint {
+                target_type,
+                endpoint,
+            } if target_type == "endpoint" => Ok(Self::Endpoint { endpoint }),
+            Target::Broadcast {
+                target_type,
+                scope,
+                endpoint_family,
+                domain,
+                hop_limit,
+            } if target_type == "broadcast" => Ok(Self::Broadcast {
+                scope,
+                endpoint_family,
+                domain,
+                hop_limit,
+            }),
+            _ => Err(serde::de::Error::custom(
+                "recipient must be one endpoint or broadcast target",
+            )),
+        }
+    }
+}
+
+fn default_wire_version() -> String {
+    "1".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EntitySubject {
     pub kind: String,
     #[serde(default)]
@@ -527,10 +198,12 @@ impl MessageTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeckrMessage {
     pub message_id: String,
+    #[serde(default = "default_wire_version")]
     pub protocol_version: String,
+    #[serde(default = "default_wire_version")]
     pub schema_version: String,
     pub lane: String,
     pub message_type: String,
@@ -551,8 +224,13 @@ pub struct DeckrMessage {
     pub in_reply_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub causation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "crate::json::deserialize_optional_value",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub trace: Option<Value>,
+    #[serde(deserialize_with = "crate::json::deserialize_value")]
     pub body: Value,
 }
 
@@ -681,19 +359,21 @@ impl DeckrMessage {
     }
 
     pub fn from_text(text: &str) -> Result<Self> {
-        let message: Self = serde_json::from_str(text)?;
-        message.validate()?;
-        Ok(message)
+        Self::from_bytes(text.as_bytes())
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let message: Self = serde_json::from_slice(bytes)?;
+        let message: Self = serde_json::from_value(crate::json::parse(bytes)?)?;
         message.validate()?;
         Ok(message)
     }
 
     pub fn hardware_body(&self) -> Result<HardwareMessageBody> {
         HardwareMessageBody::from_message(&self.message_type, &self.body)
+    }
+
+    pub fn service_body(&self) -> Result<crate::services::ServiceMessageBody> {
+        crate::services::ServiceMessageBody::from_value(self.body.clone())
     }
 
     pub fn recipient_endpoint(&self) -> Option<&str> {
@@ -704,7 +384,10 @@ impl DeckrMessage {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = Utc::now();
+        self.is_expired_at(Utc::now())
+    }
+
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
         let expires_at = self
             .expires_at
             .as_deref()
@@ -712,7 +395,10 @@ impl DeckrMessage {
             .into_iter()
             .chain(self.ttl_ms.and_then(|ttl_ms| {
                 parse_datetime(&self.created_at).and_then(|created_at| {
-                    created_at.checked_add_signed(Duration::milliseconds(ttl_ms as i64))
+                    i64::try_from(ttl_ms)
+                        .ok()
+                        .and_then(Duration::try_milliseconds)
+                        .and_then(|ttl| created_at.checked_add_signed(ttl))
                 })
             }))
             .min();
@@ -721,6 +407,7 @@ impl DeckrMessage {
 
     pub fn validate(&self) -> Result<()> {
         require_non_empty(&self.message_id, "message id")?;
+        crate::json::validate_numbers(&self.body)?;
         if self.protocol_version != DECKR_PROTOCOL_VERSION {
             return Err(Error::Invalid(format!(
                 "protocolVersion must be {DECKR_PROTOCOL_VERSION}"
@@ -756,6 +443,17 @@ impl DeckrMessage {
                 "message body must be a JSON object".to_string(),
             ));
         }
+        if let Some(trace) = &self.trace {
+            let Some(trace) = trace.as_object() else {
+                return Err(Error::Invalid("trace must be an object".into()));
+            };
+            if trace.iter().any(|(key, value)| {
+                !matches!(key.as_str(), "traceParent" | "traceState")
+                    || !(value.is_null() || value.is_string())
+            }) {
+                return Err(Error::Invalid("invalid trace context".into()));
+            }
+        }
         if self.lane == HARDWARE_MESSAGES_LANE {
             if self.contract.is_none() {
                 return Err(Error::Invalid(
@@ -763,6 +461,45 @@ impl DeckrMessage {
                 ));
             }
             self.hardware_body()?;
+            let allowed = |endpoint: &str| {
+                EndpointAddress::parse(endpoint).is_ok_and(|endpoint| {
+                    matches!(
+                        endpoint.family(),
+                        CONTROLLER_FAMILY | HARDWARE_MANAGER_FAMILY
+                    )
+                })
+            };
+            if !allowed(&self.sender)
+                || match &self.recipient {
+                    MessageTarget::Endpoint { endpoint } => !allowed(endpoint),
+                    MessageTarget::Broadcast {
+                        scope,
+                        endpoint_family,
+                        ..
+                    } => scope != "controllers" || endpoint_family != CONTROLLER_FAMILY,
+                }
+            {
+                return Err(Error::Invalid(
+                    "hardware lane endpoint family or broadcast scope is not permitted".into(),
+                ));
+            }
+        } else if self.lane == SERVICES_LANE {
+            let allowed = |endpoint: &str| {
+                EndpointAddress::parse(endpoint).is_ok_and(|endpoint| {
+                    matches!(
+                        endpoint.family(),
+                        CONTROLLER_FAMILY | ACTION_PROVIDER_FAMILY | SERVICE_FAMILY
+                    )
+                })
+            };
+            if self.message_type != "serviceMessage"
+                || self.contract.is_none()
+                || !allowed(&self.sender)
+                || !self.recipient_endpoint().is_some_and(allowed)
+            {
+                return Err(Error::Invalid("services lane requires serviceMessage, a contract, and permitted direct endpoints".into()));
+            }
+            self.service_body()?;
         }
         Ok(())
     }
@@ -795,34 +532,6 @@ impl DeckrMessage {
             return Ok(false);
         };
         Ok(EndpointAddress::parse(target)? == *endpoint)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceSourceReference {
-    pub source_id: String,
-    #[serde(rename = "type")]
-    pub source_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_id: Option<String>,
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub facts: serde_json::Map<String, Value>,
-}
-
-impl DeviceSourceReference {
-    pub fn validate(&self) -> Result<()> {
-        require_non_empty(&self.source_id, "device source reference")?;
-        require_non_empty(&self.source_type, "device source reference")?;
-        if let Some(label) = &self.label {
-            require_non_empty(label, "device source reference")?;
-        }
-        if let Some(connection_id) = &self.connection_id {
-            require_non_empty(connection_id, "device source reference")?;
-        }
-        Ok(())
     }
 }
 
@@ -1285,13 +994,13 @@ impl HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlInputBody {
     device_ref: DeviceRef,
     control_id: String,
     capability_id: String,
     event_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::deserialize_optional_value")]
     value: Option<Value>,
     #[serde(default)]
     occurred_at: Option<String>,
@@ -1317,13 +1026,13 @@ impl From<ControlInputBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ControlCommandBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
     capability_id: String,
     command_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::deserialize_object")]
     params: serde_json::Map<String, Value>,
 }
 
@@ -1340,12 +1049,13 @@ impl From<ControlCommandBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CapabilityStateChangedBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
     capability_id: String,
     state_type: Option<String>,
+    #[serde(default, deserialize_with = "crate::json::deserialize_optional_value")]
     value: Option<Value>,
     occurred_at: Option<String>,
     sequence: Option<u64>,
@@ -1366,13 +1076,13 @@ impl From<CapabilityStateChangedBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CapabilityStateRequestBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
     capability_id: String,
     state_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::deserialize_object")]
     params: serde_json::Map<String, Value>,
 }
 
@@ -1389,7 +1099,7 @@ impl From<CapabilityStateRequestBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CapabilityStateReplyBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
@@ -1397,6 +1107,7 @@ struct CapabilityStateReplyBody {
     state_type: Option<String>,
     #[serde(default = "default_ok_status")]
     status: String,
+    #[serde(default, deserialize_with = "crate::json::deserialize_optional_value")]
     value: Option<Value>,
     error: Option<String>,
 }
@@ -1416,7 +1127,7 @@ impl From<CapabilityStateReplyBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommandAcceptedBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
@@ -1438,7 +1149,7 @@ impl From<CommandAcceptedBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommandRejectedBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
@@ -1462,12 +1173,13 @@ impl From<CommandRejectedBody> for HardwareMessageBody {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommandReplyBody {
     device_ref: DeviceRef,
     control_id: Option<String>,
     capability_id: String,
     command_type: String,
+    #[serde(default, deserialize_with = "crate::json::deserialize_optional_value")]
     result: Option<Value>,
 }
 
@@ -1665,9 +1377,9 @@ pub fn validate_headers(headers: &BTreeMap<String, String>, message: &DeckrMessa
         ));
     }
     let expected = headers_for(message);
-    for (key, expected_value) in expected {
-        if let Some(actual) = headers.get(&key) {
-            if actual != &expected_value {
+    for key in ROUTING_HEADERS {
+        if let Some(actual) = headers.get(*key) {
+            if expected.get(*key) != Some(actual) {
                 return Err(Error::Invalid(format!(
                     "NATS header {key} disagrees with Deckr envelope"
                 )));
@@ -1676,6 +1388,18 @@ pub fn validate_headers(headers: &BTreeMap<String, String>, message: &DeckrMessa
     }
     Ok(())
 }
+
+pub(crate) const ROUTING_HEADERS: &[&str] = &[
+    "Deckr-Message-Id",
+    "Deckr-Message-Type",
+    "Deckr-Sender",
+    "Deckr-Sender-Session",
+    "Deckr-Recipient",
+    "Deckr-Recipient-Session",
+    "Deckr-Contract-Id",
+    "Deckr-Contract-Generation",
+    "Deckr-In-Reply-To",
+];
 
 pub fn validate_subject_hint(subject: &str, message: &DeckrMessage) -> Result<()> {
     message.validate()?;
@@ -1765,7 +1489,7 @@ fn require_not_endpoint_address(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_contract_token(value: &str, field_name: &str) -> Result<()> {
+pub(crate) fn require_contract_token(value: &str, field_name: &str) -> Result<()> {
     require_non_empty(value, field_name)?;
     let mut segments = value.split('.');
     let Some(first) = segments.next() else {
@@ -1789,7 +1513,7 @@ fn require_contract_token(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_globally_qualified_name(value: &str, field_name: &str) -> Result<()> {
+pub(crate) fn require_globally_qualified_name(value: &str, field_name: &str) -> Result<()> {
     require_contract_token(value, field_name)?;
     if !value.contains('.') {
         return Err(Error::Invalid(format!(
@@ -1865,7 +1589,7 @@ fn validate_contract_token_list(values: &[String], field_name: &str) -> Result<(
     require_unique(values, "event or command types")
 }
 
-fn validate_core_capability_family(family: &str) -> Result<()> {
+pub(crate) fn validate_core_capability_family(family: &str) -> Result<()> {
     if family.starts_with("dev.deckr.")
         && !matches!(
             family,
@@ -1883,7 +1607,7 @@ fn validate_core_capability_family(family: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_capability_direction(direction: &str) -> Result<()> {
+pub(crate) fn validate_capability_direction(direction: &str) -> Result<()> {
     if !matches!(direction, "input" | "output" | "state" | "command") {
         return Err(Error::Invalid(
             "capability direction must be input, output, state, or command".to_string(),
@@ -1980,6 +1704,7 @@ mod tests {
                     width: Some(4.0),
                     height: Some(3.0),
                     unit: "grid".to_string(),
+                    ..Default::default()
                 }),
                 input_capabilities: Vec::new(),
                 output_capabilities: vec![CapabilityDescriptor {
@@ -1998,9 +1723,12 @@ mod tests {
                     }],
                     event_types: Vec::new(),
                     command_types: vec!["set_frame".to_string(), "clear".to_string()],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
             capabilities: Vec::new(),
+            ..Default::default()
         }
     }
 }

@@ -6,7 +6,7 @@ rust-version = "1.88"
 license = "MIT"
 description = "Rust implementation of the Deckr protocols and shared runtime"
 readme = "README.md"
-include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [features]
 default = []
@@ -25,11 +25,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 futures-channel = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+jsonschema = { version = "0.59", default-features = false, features = ["arbitrary-precision", "idna"] }
+num-bigint = "0.4"
+num-rational = "0.4"
 ring = "0.17"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision", "raw_value"] }
 thiserror = "2.0"
-tokio = { version = "1.39", features = ["rt", "sync", "time"] }
+tokio = { version = "1.39", features = ["macros", "rt", "sync", "time"] }
 uuid = { version = "1.23", features = ["v4"] }
 
 [dev-dependencies]

@@ -1519,6 +1519,39 @@ async fn concord_contract_notifications_include_contract_and_token_details() {
 }
 
 #[tokio::test]
+async fn observing_a_refreshed_token_cannot_renew_or_restore_a_local_lease() {
+    let concord = ConcordCoordinator::new(
+        MemoryStateStore::new(),
+        MemoryStateStore::ttl_bound(1).unwrap(),
+    );
+    let participant = EndpointAddress::parse("controller:observer").unwrap();
+    let contract = concord
+        .create_contract(CreateContractSpec::new(vec![participant.clone()]))
+        .await
+        .unwrap();
+    let mut lease =
+        ConcordParticipantLease::new(contract.clone(), participant.clone(), "session".into())
+            .unwrap();
+    let token = lease.attach_or_refresh(&concord).await.unwrap();
+    let mut changed_ttl = token.clone();
+    changed_ttl.ttl_seconds = 60;
+    assert!(lease.adopt(changed_ttl).is_err());
+
+    // An external observer sees the same owned token refreshed. Accepting its
+    // new revision must not replace this lease's own heartbeat obligation.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let refreshed = concord.refresh(&token).await.unwrap();
+    lease.adopt(refreshed.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(lease.token().is_none());
+    assert!(concord.validate(&contract, None).await.valid());
+    assert!(lease.adopt(refreshed.clone()).is_err());
+    assert!(lease.attach_or_refresh(&concord).await.is_err());
+    assert!(lease.token().is_none());
+    concord.withdraw(&refreshed).await.unwrap();
+}
+
+#[tokio::test]
 async fn concord_participant_manager_notification_discovers_new_contract() {
     let contracts = MemoryStateStore::new();
     let tokens = token_store();

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -25,7 +25,8 @@ use crate::concord::{
     DEFAULT_CONCORD_MAINTENANCE_STORE_NAME, DEFAULT_CONCORD_TOKEN_STORE_NAME,
 };
 use crate::endpoint::EndpointAddress;
-use crate::lanes::{headers_for, validate_subject_hint, DeckrMessage, HARDWARE_MESSAGES_LANE};
+use crate::lanes::{headers_for, DeckrMessage, HARDWARE_MESSAGES_LANE};
+use crate::messaging::{Delivery, DeliveryStream, MessageTransport, ReplyInbox};
 use crate::state::{
     MaterializedStateStore, StateChange, StateEntry, StateOperation, StateSource, StateStore,
     StateStorePolicy, StateWatchStream,
@@ -108,18 +109,34 @@ impl DeckrRuntime {
             MaterializedStateStore<NatsStateStore>,
         >,
     > {
-        Ok(ConcordCoordinator::new(
-            MaterializedStateStore::start(
-                self.inner.concord_contracts().clone(),
-                crate::keys::concord_contracts_prefix(),
-            )
-            .await?,
-            MaterializedStateStore::start(
-                self.inner.concord_tokens().clone(),
-                crate::keys::concord_contracts_prefix(),
-            )
-            .await?,
-        ))
+        self.inner.materialized_concord().await
+    }
+
+    pub async fn protocols(&self) -> Result<NatsProtocolRuntime> {
+        self.inner.protocols().await
+    }
+
+    /// Explicit exact-store maintenance capability; starts no scans or watches.
+    pub async fn maintenance(
+        &self,
+    ) -> Result<crate::concord::ConcordMaintenance<NatsStateStore, NatsStateStore, NatsStateStore>>
+    {
+        self.inner.maintenance().await
+    }
+
+    pub async fn service_views(
+        &self,
+        bucket: &str,
+        policy: StateStorePolicy,
+    ) -> Result<crate::services::ServiceViewStore<NatsStateStore>> {
+        self.inner.service_views(bucket, policy).await
+    }
+
+    pub fn messaging(
+        &self,
+        session: crate::session::EndpointSession,
+    ) -> Result<crate::messaging::MessageSession<NatsMessageTransport>> {
+        crate::messaging::MessageSession::new(self.inner.message_transport(), session)
     }
 
     pub fn endpoint(
@@ -202,7 +219,18 @@ impl EndpointSession {
     }
 }
 
-#[derive(Debug, Clone)]
+pub type NatsProtocolRuntime =
+    crate::runtime::ProtocolRuntime<NatsStateStore, NatsStateStore, NatsStateStore>;
+
+type ServiceViewSources = BTreeMap<
+    String,
+    (
+        StateStorePolicy,
+        Arc<tokio::sync::OnceCell<crate::services::ServiceViewStore<NatsStateStore>>>,
+    ),
+>;
+
+#[derive(Clone)]
 pub struct NatsDeckrRuntime {
     client: async_nats::Client,
     beacon_advertisements: NatsStateStore,
@@ -210,6 +238,26 @@ pub struct NatsDeckrRuntime {
     concord_tokens: NatsStateStore,
     concord_maintenance_bucket: String,
     connection_epoch: Arc<AtomicU64>,
+    beacon_view: Arc<tokio::sync::OnceCell<crate::beacon::Beacon<NatsStateStore>>>,
+    concord_view: Arc<
+        tokio::sync::OnceCell<crate::runtime::MaterializedConcord<NatsStateStore, NatsStateStore>>,
+    >,
+    service_views: Arc<Mutex<ServiceViewSources>>,
+    source_gate: Arc<tokio::sync::RwLock<()>>,
+    source_stop: crate::lifecycle::Cancellation,
+}
+
+impl std::fmt::Debug for NatsDeckrRuntime {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NatsDeckrRuntime")
+            .field("beacon_advertisements", &self.beacon_advertisements)
+            .field("concord_contracts", &self.concord_contracts)
+            .field("concord_tokens", &self.concord_tokens)
+            .field("beacon_started", &self.beacon_view.initialized())
+            .field("concord_started", &self.concord_view.initialized())
+            .finish_non_exhaustive()
+    }
 }
 
 impl NatsDeckrRuntime {
@@ -285,7 +333,177 @@ impl NatsDeckrRuntime {
             concord_tokens,
             concord_maintenance_bucket: config.concord_maintenance_bucket,
             connection_epoch,
+            beacon_view: Arc::default(),
+            concord_view: Arc::default(),
+            service_views: Arc::default(),
+            source_gate: Arc::default(),
+            source_stop: Default::default(),
         })
+    }
+
+    /// Lazily start shared sources. Each protocol also has an independent entry
+    /// point so one protocol's readiness does not depend on the other.
+    pub async fn protocols(&self) -> Result<NatsProtocolRuntime> {
+        Ok(crate::runtime::ProtocolRuntime::from_views(
+            self.managed_beacon().await?,
+            self.materialized_concord().await?,
+        ))
+    }
+
+    pub async fn managed_beacon(&self) -> Result<crate::beacon::Beacon<NatsStateStore>> {
+        self.source_work(async {
+            self.beacon_view
+                .get_or_try_init(|| {
+                    crate::beacon::Beacon::start(self.beacon_advertisements.clone())
+                })
+                .await
+                .cloned()
+        })
+        .await
+    }
+
+    pub async fn materialized_concord(
+        &self,
+    ) -> Result<crate::runtime::MaterializedConcord<NatsStateStore, NatsStateStore>> {
+        self.source_work(async {
+            self.concord_view
+                .get_or_try_init(|| async {
+                    Ok(ConcordCoordinator::new(
+                        MaterializedStateStore::start(
+                            self.concord_contracts.clone(),
+                            crate::keys::concord_contracts_prefix(),
+                        )
+                        .await?,
+                        MaterializedStateStore::start(
+                            self.concord_tokens.clone(),
+                            crate::keys::concord_contracts_prefix(),
+                        )
+                        .await?,
+                    ))
+                })
+                .await
+                .cloned()
+        })
+        .await
+    }
+
+    /// Open the explicitly named view bucket once per host runtime. Different
+    /// families and agreements borrow its one materialized source. Reusing a
+    /// name with incompatible TTL policy is an error, not a second consumer.
+    pub async fn service_views(
+        &self,
+        bucket: &str,
+        policy: StateStorePolicy,
+    ) -> Result<crate::services::ServiceViewStore<NatsStateStore>> {
+        if bucket.is_empty()
+            || !bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || policy.broker_ttl_seconds == Some(0)
+        {
+            return Err(Error::Invalid(
+                "invalid service view bucket name or TTL policy".into(),
+            ));
+        }
+        self.source_work(async {
+            let cell = {
+                let mut sources = self
+                    .service_views
+                    .lock()
+                    .expect("service source lock poisoned");
+                let (existing, cell) = sources
+                    .entry(bucket.into())
+                    .or_insert_with(|| (policy.clone(), Arc::default()));
+                if existing.broker_ttl_seconds != policy.broker_ttl_seconds
+                    || existing.allow_write_ttl != policy.allow_write_ttl
+                {
+                    return Err(Error::Invalid(
+                        "service view bucket already opened with another TTL policy".into(),
+                    ));
+                }
+                cell.clone()
+            };
+            cell.get_or_try_init(|| async {
+                let store = open_state_bucket(
+                    &async_nats::jetstream::new(self.client.clone()),
+                    &self.client,
+                    &self.connection_epoch,
+                    bucket,
+                    policy,
+                )
+                .await?;
+                crate::services::ServiceViewStore::new(
+                    bucket,
+                    MaterializedStateStore::start(store, "").await?,
+                )
+            })
+            .await
+            .cloned()
+        })
+        .await
+    }
+
+    async fn source_work<R>(
+        &self,
+        work: impl std::future::Future<Output = Result<R>>,
+    ) -> Result<R> {
+        let _gate = self.source_gate.read().await;
+        tokio::select! { biased;
+            _ = self.source_stop.cancelled() => Err(Error::Closed("runtime sources closed".into())),
+            result = work => {
+                if self.source_stop.is_cancelled() {
+                    self.request_close_sources();
+                    Err(Error::Closed("runtime sources closed".into()))
+                } else {
+                    result
+                }
+            },
+        }
+    }
+
+    /// Revoke source access immediately, including pending lazy initializers.
+    pub fn request_close_sources(&self) {
+        self.source_stop.cancel();
+        if let Some(beacon) = self.beacon_view.get() {
+            beacon.materialized_store().close();
+        }
+        if let Some(concord) = self.concord_view.get() {
+            concord.close_sources();
+        }
+        for (_, cell) in self
+            .service_views
+            .lock()
+            .expect("service source lock poisoned")
+            .values()
+        {
+            if let Some(store) = cell.get() {
+                store.source().close();
+            }
+        }
+    }
+
+    /// The host calls this after closing its dependent endpoint lifetimes.
+    pub async fn close_sources(&self) {
+        self.request_close_sources();
+        let _gate = self.source_gate.write().await;
+        // Initialization can finish immediately before observing cancellation.
+        self.request_close_sources();
+        if let Some(beacon) = self.beacon_view.get() {
+            beacon.materialized_store().close_and_wait().await;
+        }
+        if let Some(concord) = self.concord_view.get() {
+            concord.close_sources_and_wait().await;
+        }
+        let sources: Vec<_> = self
+            .service_views
+            .lock()
+            .expect("service source lock poisoned")
+            .values()
+            .filter_map(|(_, cell)| cell.get().cloned())
+            .collect();
+        for store in sources {
+            store.source().close_and_wait().await;
+        }
     }
 
     pub fn beacon_advertisements(&self) -> &NatsStateStore {
@@ -312,6 +530,18 @@ impl NatsDeckrRuntime {
         .await
     }
 
+    /// Dedicated access to all three raw stores for optional maintenance.
+    pub async fn maintenance(
+        &self,
+    ) -> Result<crate::concord::ConcordMaintenance<NatsStateStore, NatsStateStore, NatsStateStore>>
+    {
+        Ok(crate::concord::ConcordMaintenance::new(
+            self.concord_contracts.clone(),
+            self.concord_tokens.clone(),
+            self.concord_maintenance().await?,
+        ))
+    }
+
     pub async fn publish(&self, message: &DeckrMessage) -> Result<()> {
         let subject = crate::lanes::subject_for(message)?;
         self.client
@@ -322,6 +552,10 @@ impl NatsDeckrRuntime {
             )
             .await
             .map_err(|error| Error::StateUnavailable(format!("publishing lane message: {error}")))
+    }
+
+    pub fn message_transport(&self) -> NatsMessageTransport {
+        NatsMessageTransport::new(self.client.clone())
     }
 
     pub async fn subscribe_hardware_messages(&self) -> Result<Subscriber> {
@@ -342,27 +576,9 @@ impl NatsDeckrRuntime {
         lane: &str,
         endpoint: &crate::endpoint::EndpointAddress,
     ) -> Result<EndpointLaneSubscriber> {
-        let [direct_subject, broadcast_subject] =
-            crate::lanes::endpoint_subscription_subjects(lane, endpoint)?;
-        let direct = self
-            .client
-            .subscribe(direct_subject.clone())
+        self.message_transport()
+            .subscribe_lane(lane, endpoint)
             .await
-            .map_err(|error| {
-                Error::StateUnavailable(format!(
-                    "subscribing to direct lane subject {direct_subject}: {error}"
-                ))
-            })?;
-        let broadcast = self
-            .client
-            .subscribe(broadcast_subject.clone())
-            .await
-            .map_err(|error| {
-                Error::StateUnavailable(format!(
-                    "subscribing to broadcast lane subject {broadcast_subject}: {error}"
-                ))
-            })?;
-        Ok(EndpointLaneSubscriber { direct, broadcast })
     }
 
     pub async fn subscribe_endpoint_hardware_messages(
@@ -374,30 +590,147 @@ impl NatsDeckrRuntime {
     }
 
     pub fn message_from_nats(&self, message: Message) -> Result<DeckrMessage> {
-        let envelope = DeckrMessage::from_bytes(&message.payload)?;
-        validate_subject_hint(message.subject.as_str(), &envelope)?;
-        if let Some(headers) = message.headers.as_ref() {
-            validate_nats_headers(headers, &envelope)?;
-        }
-        Ok(envelope)
+        Ok(decode_delivery(message, false)?.message)
     }
 }
 
 #[derive(Debug)]
 pub struct EndpointLaneSubscriber {
     direct: Subscriber,
-    broadcast: Subscriber,
+    broadcast: Option<Subscriber>,
 }
 
 impl EndpointLaneSubscriber {
     pub async fn next(&mut self) -> Option<Message> {
+        let Some(broadcast) = self.broadcast.as_mut() else {
+            return self.direct.next().await;
+        };
         let direct = self.direct.next();
-        let broadcast = self.broadcast.next();
+        let broadcast = broadcast.next();
         pin_mut!(direct);
         pin_mut!(broadcast);
         match select(direct, broadcast).await {
             Either::Left((message, _)) | Either::Right((message, _)) => message,
         }
+    }
+}
+
+/// Core NATS messaging needs no JetStream or protocol-store privileges. The
+/// host may share its client while each managed endpoint owns subscriptions.
+#[derive(Clone, Debug)]
+pub struct NatsMessageTransport {
+    client: async_nats::Client,
+}
+impl NatsMessageTransport {
+    pub fn new(client: async_nats::Client) -> Self {
+        Self { client }
+    }
+
+    async fn subscribe_lane(
+        &self,
+        lane: &str,
+        endpoint: &EndpointAddress,
+    ) -> Result<EndpointLaneSubscriber> {
+        let [direct_subject, broadcast_subject] =
+            crate::lanes::endpoint_subscription_subjects(lane, endpoint)?;
+        let direct = self
+            .client
+            .subscribe(direct_subject)
+            .await
+            .map_err(|error| {
+                Error::StateUnavailable(format!("direct lane subscription: {error}"))
+            })?;
+        // Core services have no broadcast route. Hardware broadcasts address
+        // controllers only; other families must not require those permissions.
+        let accepts_broadcast = lane != crate::lanes::SERVICES_LANE
+            && (lane != HARDWARE_MESSAGES_LANE
+                || endpoint.family() == crate::endpoint::CONTROLLER_FAMILY);
+        let broadcast = if accepts_broadcast {
+            Some(
+                self.client
+                    .subscribe(broadcast_subject)
+                    .await
+                    .map_err(|error| {
+                        Error::StateUnavailable(format!("broadcast lane subscription: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        self.client.flush().await.map_err(|error| {
+            Error::StateUnavailable(format!("lane subscription readiness: {error}"))
+        })?;
+        Ok(EndpointLaneSubscriber { direct, broadcast })
+    }
+}
+
+fn decode_delivery(message: Message, inbox: bool) -> Result<Delivery> {
+    let envelope = DeckrMessage::from_bytes(&message.payload)?;
+    if !inbox && message.subject.as_str() != crate::lanes::subject_for(&envelope)? {
+        return Err(Error::Invalid(
+            "lane subject disagrees with envelope routing".into(),
+        ));
+    }
+    if let Some(headers) = message.headers.as_ref() {
+        validate_nats_headers(headers, &envelope)?;
+    }
+    Ok(Delivery {
+        message: envelope,
+        reply_address: message.reply.map(|address| address.to_string()),
+    })
+}
+
+impl MessageTransport for NatsMessageTransport {
+    async fn subscribe(&self, lane: &str, endpoint: &EndpointAddress) -> Result<DeliveryStream> {
+        let subscriber = self.subscribe_lane(lane, endpoint).await?;
+        Ok(Box::pin(futures_util::stream::unfold(
+            subscriber,
+            |mut subscriber| async move {
+                subscriber
+                    .next()
+                    .await
+                    .map(|message| (decode_delivery(message, false), subscriber))
+            },
+        )))
+    }
+    async fn open_inbox(&self) -> Result<ReplyInbox> {
+        let address = self.client.new_inbox();
+        let subscriber = self
+            .client
+            .subscribe(address.clone())
+            .await
+            .map_err(|error| {
+                Error::StateUnavailable(format!("reply inbox subscription: {error}"))
+            })?;
+        self.client
+            .flush()
+            .await
+            .map_err(|error| Error::StateUnavailable(format!("reply inbox readiness: {error}")))?;
+        Ok(ReplyInbox {
+            address,
+            messages: Box::pin(subscriber.map(|message| decode_delivery(message, true))),
+        })
+    }
+    async fn publish(
+        &self,
+        message: &DeckrMessage,
+        inbox: Option<&str>,
+        reply_address: Option<&str>,
+    ) -> Result<()> {
+        let lane_subject = crate::lanes::subject_for(message)?;
+        let subject = inbox.unwrap_or(&lane_subject).to_string();
+        let payload = serde_json::to_vec(message)?.into();
+        let headers = nats_headers_for(message);
+        let result = if let Some(reply) = reply_address {
+            self.client
+                .publish_with_reply_and_headers(subject, reply.to_string(), headers, payload)
+                .await
+        } else {
+            self.client
+                .publish_with_headers(subject, headers, payload)
+                .await
+        };
+        result.map_err(|error| Error::StateUnavailable(format!("publishing message: {error}")))
     }
 }
 
@@ -609,7 +942,7 @@ impl NatsSourceWatch {
         let entry = if operation == StateOperation::Put {
             Some(StateEntry {
                 key: key.clone(),
-                value: serde_json::from_slice(&message.payload)?,
+                value: crate::json::parse(&message.payload)?,
                 revision,
             })
         } else {
@@ -673,7 +1006,7 @@ impl StateStore for NatsStateStore {
         }
         Ok(Some(StateEntry {
             key: key.to_string(),
-            value: serde_json::from_slice(&entry.value)?,
+            value: crate::json::parse(&entry.value)?,
             revision: entry.revision,
         }))
     }
@@ -742,7 +1075,10 @@ impl StateStore for NatsStateStore {
             .await;
         let revision = result.map_err(|error| {
             if is_revision_conflict(&error) {
-                Error::StateConflict(format!("state key {key:?} already exists"))
+                Error::mutation(
+                    crate::MutationCode::KeyAlreadyExists,
+                    format!("state key {key:?} already exists"),
+                )
             } else {
                 Error::StateUnavailable(format!("creating state key {key}: {error}"))
             }
@@ -768,7 +1104,10 @@ impl StateStore for NatsStateStore {
             .await;
         let new_revision = result.map_err(|error| {
             if is_revision_conflict(&error) {
-                Error::StateConflict(format!("state key {key:?} revision changed"))
+                Error::mutation(
+                    crate::MutationCode::RevisionChanged,
+                    format!("state key {key:?} revision changed"),
+                )
             } else {
                 Error::StateUnavailable(format!("updating state key {key}: {error}"))
             }
@@ -798,7 +1137,10 @@ impl StateStore for NatsStateStore {
             .await
             .map_err(|error| {
                 if is_revision_conflict(&error) {
-                    Error::StateConflict(format!("state key {key:?} revision changed"))
+                    Error::mutation(
+                        crate::MutationCode::RevisionChanged,
+                        format!("state key {key:?} revision changed"),
+                    )
                 } else {
                     Error::StateUnavailable(format!("deleting state: {error}"))
                 }
@@ -850,17 +1192,16 @@ pub fn nats_headers_for(message: &DeckrMessage) -> HeaderMap {
 
 pub fn validate_nats_headers(headers: &HeaderMap, message: &DeckrMessage) -> Result<()> {
     let mut map = BTreeMap::new();
-    for key in [
-        "Deckr-Message-Id",
-        "Deckr-Message-Type",
-        "Deckr-Sender",
-        "Deckr-Sender-Session",
-        "Deckr-Recipient",
-        "Deckr-Recipient-Session",
-        "Deckr-In-Reply-To",
-    ] {
-        if let Some(value) = headers.get(key) {
-            map.insert(key.to_string(), value.as_str().to_string());
+    for key in crate::lanes::ROUTING_HEADERS {
+        for value in headers.get_all(*key) {
+            if map
+                .insert(key.to_string(), value.as_str().to_string())
+                .is_some_and(|previous| previous != value.as_str())
+            {
+                return Err(Error::Invalid(format!(
+                    "conflicting values for NATS header {key}"
+                )));
+            }
         }
     }
     crate::lanes::validate_headers(&map, message)
@@ -972,6 +1313,57 @@ fn is_revision_conflict(error: &impl Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lane_and_inbox_decoding_reject_conflicting_or_partial_hints() {
+        let envelope = DeckrMessage::from_text(&serde_json::json!({
+            "messageId":"id", "createdAt":"2026-01-01T00:00:00Z", "lane":"services", "messageType":"serviceMessage",
+            "sender":"service:peer", "senderSessionId":"peer-session", "recipient":{"endpoint":"controller:local"},
+            "contract":{"contractId":"exact", "generation":1}, "subject":{"kind":"service"},
+            "body":{"serviceNamespace":"org.example.test", "name":"read", "intent":"query", "exchangePattern":"request_reply"}
+        }).to_string()).unwrap();
+        let raw = Message {
+            subject: crate::lanes::subject_for(&envelope).unwrap().into(),
+            reply: None,
+            payload: serde_json::to_vec(&envelope).unwrap().into(),
+            headers: None,
+            status: None,
+            description: None,
+            length: 0,
+        };
+        assert!(decode_delivery(raw.clone(), false).is_ok());
+        let mut inbox = raw.clone();
+        inbox.subject = "_INBOX.private".into();
+        assert!(decode_delivery(inbox.clone(), false).is_err());
+        assert!(decode_delivery(inbox, true).is_ok());
+        for case in 0..5 {
+            let mut bad = raw.clone();
+            let mut headers = HeaderMap::new();
+            match case {
+                0 => {
+                    headers.insert("Deckr-Contract-Id", "exact");
+                }
+                1 => {
+                    headers.insert("Deckr-Contract-Id", "other");
+                    headers.insert("Deckr-Contract-Generation", "1");
+                }
+                2 => {
+                    headers.append("Deckr-Message-Id", "id");
+                    headers.append("Deckr-Message-Id", "conflicting");
+                }
+                3 => {
+                    headers.insert("Deckr-Recipient-Session", "not-in-envelope");
+                }
+                _ => {
+                    headers.insert("Deckr-In-Reply-To", "not-in-envelope");
+                }
+            }
+            bad.headers = Some(headers);
+            assert!(decode_delivery(bad.clone(), false).is_err(), "case {case}");
+            bad.subject = "_INBOX.private".into();
+            assert!(decode_delivery(bad, true).is_err(), "inbox case {case}");
+        }
+    }
 
     #[test]
     fn kv_config_for_ttl_policy_sets_limit_markers() {

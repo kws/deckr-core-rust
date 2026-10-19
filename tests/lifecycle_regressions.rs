@@ -400,6 +400,53 @@ impl HardwareCommandHandler for NullHandler {
 }
 
 #[tokio::test]
+async fn endpoint_lifetimes_share_sources_without_closing_each_other() {
+    let contracts = ControlledStore::new(None);
+    let tokens = ControlledStore::new(Some(120));
+    let beacon = ControlledStore::new(Some(300));
+    let protocols =
+        deckr::runtime::ProtocolRuntime::start(beacon.clone(), contracts.clone(), tokens.clone())
+            .await
+            .unwrap();
+    let manager = |id: &str| {
+        HardwareManagerRuntime::with_concord(
+            HardwareManagerRuntimeSpec {
+                manager_id: id.into(),
+                session_id: format!("{id}-session"),
+                labels: Default::default(),
+                beacon_state: beacon.clone(),
+                concord_contract_state: contracts.clone(),
+                concord_token_state: tokens.clone(),
+                lane: NullLane,
+                maintenance_policy: Default::default(),
+                command_handler: Arc::new(NullHandler),
+                reset_handler: None,
+            },
+            protocols.concord().clone(),
+        )
+        .unwrap()
+    };
+    let first = manager("first");
+    let second = manager("second");
+    let mut tasks = tokio::task::JoinSet::new();
+    first.start(&mut tasks).await.unwrap();
+    second.start(&mut tasks).await.unwrap();
+    for store in [&beacon, &contracts, &tokens] {
+        assert_eq!(store.active_sources.load(Ordering::SeqCst), 1);
+    }
+    first.stop().await.unwrap();
+    assert!(protocols.concord().is_current());
+    assert!(protocols.beacon().materialized_store().is_current());
+    assert_eq!(contracts.active_sources.load(Ordering::SeqCst), 1);
+    second.stop().await.unwrap();
+    protocols.close().await;
+    for store in [&beacon, &contracts, &tokens] {
+        assert_eq!(store.active_sources.load(Ordering::SeqCst), 0);
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+#[tokio::test]
 async fn stop_joins_workers_and_closes_owned_sources_with_blocked_cleanup() {
     let contracts = ControlledStore::new(None);
     let tokens = ControlledStore::new(Some(120));
@@ -538,5 +585,114 @@ async fn protocol_watches_start_with_complete_filtered_membership() {
     assert!(snapshot.current);
     assert_eq!(snapshot.contracts.len(), 1);
     assert!(snapshot.changed.is_empty());
+    concord.close_sources_and_wait().await;
+}
+
+#[tokio::test]
+async fn managed_contexts_do_not_recover_old_authority_when_exact_records_stay_valid() {
+    use deckr::concord::{AgreementIntent, ParticipantCandidates};
+    use deckr::session::EndpointSession;
+    let contracts = ControlledStore::new(None);
+    let tokens = ControlledStore::new(Some(120));
+    let c = MaterializedStateStore::start(contracts.clone(), "contracts.")
+        .await
+        .unwrap();
+    let t = MaterializedStateStore::start(tokens.clone(), "contracts.")
+        .await
+        .unwrap();
+    let concord = ConcordCoordinator::new(c.clone(), t.clone());
+    let a = EndpointSession::new(EndpointAddress::parse_protocol("worker:a").unwrap());
+    let b = EndpointSession::new(EndpointAddress::parse_protocol("worker:b").unwrap());
+    let participant = concord
+        .participate(
+            b.clone(),
+            None,
+            |candidates: ParticipantCandidates| async move {
+                Ok(candidates
+                    .contracts
+                    .into_iter()
+                    .map(|member| deckr::authority::ContractPointer {
+                        contract_id: member.contract.contract_id,
+                        generation: member.contract.generation,
+                    })
+                    .collect())
+            },
+        )
+        .unwrap();
+    let proposal = concord
+        .propose(
+            a.clone(),
+            AgreementIntent::new(vec![a.endpoint().clone(), b.endpoint().clone()]),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proposal.wait_ready(None))
+        .await
+        .unwrap()
+        .unwrap();
+    let pointer = deckr::authority::ContractPointer {
+        contract_id: proposal.contract().contract_id.clone(),
+        generation: 1,
+    };
+    let accepted = participant.agreement(&pointer).unwrap();
+    contracts.fail_updates.store(true, Ordering::SeqCst);
+    tokens.fail_deletes.store(true, Ordering::SeqCst);
+    contracts.fail_watch();
+    wait_until(|| !c.is_current()).await;
+    assert!(!proposal.has_authority());
+    assert!(!accepted.has_authority());
+    tokio::time::timeout(Duration::from_secs(2), c.wait_current())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(concord.validate(proposal.contract(), None).await.valid());
+    assert!(!proposal.has_authority());
+    assert!(!accepted.has_authority());
+    contracts.fail_updates.store(false, Ordering::SeqCst);
+    tokens.fail_deletes.store(false, Ordering::SeqCst);
+    let _ = proposal.close().await;
+    let _ = participant.close().await;
+    concord.close_sources_and_wait().await;
+}
+
+#[tokio::test]
+async fn shared_concord_index_preserves_interruption_and_removes_missing_members_after_recovery() {
+    let contracts = ControlledStore::new(None);
+    let tokens = ControlledStore::new(Some(120));
+    let c = MaterializedStateStore::start(contracts.clone(), "contracts.")
+        .await
+        .unwrap();
+    let t = MaterializedStateStore::start(tokens, "contracts.")
+        .await
+        .unwrap();
+    let concord = ConcordCoordinator::new(c.clone(), t.clone());
+    let contract = concord
+        .create_contract(CreateContractSpec::new(vec![
+            EndpointAddress::parse_protocol("worker:recover").unwrap(),
+        ]))
+        .await
+        .unwrap();
+    let mut watch = concord.watch_state(Default::default()).unwrap();
+    assert_eq!(watch.next().await.unwrap().contracts.len(), 1);
+    contracts.fail_watch();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while c.is_current() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    contracts.raw.delete(&contract.key, None).await.unwrap();
+    c.wait_current().await.unwrap();
+    // A synchronous query may synchronize the index ahead of its worker. The
+    // queued watch must still expose lost currentness before recovered state.
+    assert!(concord
+        .contracts_cached(Default::default())
+        .unwrap()
+        .is_empty());
+    let lost = watch.next().await.unwrap();
+    assert!(!lost.current);
+    let recovered = watch.next().await.unwrap();
+    assert!(recovered.current);
+    assert!(recovered.contracts.is_empty());
     concord.close_sources_and_wait().await;
 }

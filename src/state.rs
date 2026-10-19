@@ -384,6 +384,7 @@ pub struct MaterializedStateStore<S: StateStore> {
 struct SourceOwner {
     task: Mutex<Option<JoinHandle<()>>>,
     inner: Arc<Mutex<MaterializedStateInner>>,
+    runtime: tokio::runtime::Handle,
 }
 impl Drop for SourceOwner {
     fn drop(&mut self) {
@@ -471,6 +472,7 @@ impl<S: StateStore> MaterializedStateStore<S> {
         let owner = Arc::new(SourceOwner {
             task: Mutex::new(Some(task)),
             inner: inner.clone(),
+            runtime: tokio::runtime::Handle::current(),
         });
         Ok(Self {
             state,
@@ -483,6 +485,10 @@ impl<S: StateStore> MaterializedStateStore<S> {
     pub fn status(&self) -> MaterializedStateStatus {
         self.inner.lock().expect("source lock poisoned").status
     }
+    /// Prefix covered by this source's atomic snapshots and observations.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
     pub fn is_current(&self) -> bool {
         self.status() == MaterializedStateStatus::Ready
     }
@@ -494,6 +500,14 @@ impl<S: StateStore> MaterializedStateStore<S> {
             .lock()
             .expect("source lock poisoned")
             .snapshot("", BTreeSet::new(), false)
+    }
+    /// Internal views can synchronize without copying unchanged source state.
+    pub(crate) fn snapshot_if_changed(&self, version: Option<u64>) -> Option<StateSnapshot> {
+        let inner = self.inner.lock().expect("source lock poisoned");
+        (version != Some(inner.generation)).then(|| inner.snapshot("", BTreeSet::new(), false))
+    }
+    pub(crate) fn runtime_handle(&self) -> tokio::runtime::Handle {
+        self.owner.runtime.clone()
     }
     pub fn authority_epoch(&self) -> Option<u64> {
         let inner = self.inner.lock().expect("source lock poisoned");
@@ -1097,9 +1111,10 @@ impl StateStore for MemoryStateStore {
         let mut inner = self.inner.lock().expect("memory state mutex poisoned");
         Self::validate_ttl(&inner, ttl)?;
         if inner.entries.contains_key(key) {
-            return Err(Error::StateConflict(format!(
-                "state key {key:?} already exists"
-            )));
+            return Err(Error::mutation(
+                crate::MutationCode::KeyAlreadyExists,
+                format!("state key {key:?} already exists"),
+            ));
         }
         let entry = StateEntry {
             key: key.to_string(),
@@ -1129,14 +1144,16 @@ impl StateStore for MemoryStateStore {
         let mut inner = self.inner.lock().expect("memory state mutex poisoned");
         Self::validate_ttl(&inner, ttl)?;
         let Some(current) = inner.entries.get(key) else {
-            return Err(Error::StateConflict(format!(
-                "state key {key:?} is missing"
-            )));
+            return Err(Error::mutation(
+                crate::MutationCode::RevisionChanged,
+                format!("state key {key:?} is missing"),
+            ));
         };
         if current.revision != revision {
-            return Err(Error::StateConflict(format!(
-                "state key {key:?} revision changed"
-            )));
+            return Err(Error::mutation(
+                crate::MutationCode::RevisionChanged,
+                format!("state key {key:?} revision changed"),
+            ));
         }
         let entry = StateEntry {
             key: key.to_string(),
@@ -1164,14 +1181,16 @@ impl StateStore for MemoryStateStore {
         let mut inner = self.inner.lock().expect("memory state mutex poisoned");
         if let Some(expected) = revision {
             let Some(current) = inner.entries.get(key) else {
-                return Err(Error::StateConflict(format!(
-                    "state key {key:?} is missing"
-                )));
+                return Err(Error::mutation(
+                    crate::MutationCode::RevisionChanged,
+                    format!("state key {key:?} is missing"),
+                ));
             };
             if current.revision != expected {
-                return Err(Error::StateConflict(format!(
-                    "state key {key:?} revision changed"
-                )));
+                return Err(Error::mutation(
+                    crate::MutationCode::RevisionChanged,
+                    format!("state key {key:?} revision changed"),
+                ));
             }
         }
         inner.entries.remove(key);

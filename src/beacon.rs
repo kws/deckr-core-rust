@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::SecondsFormat;
 use futures_core::Stream;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -15,10 +16,12 @@ use crate::keys::{
     parse_beacon_advertisement_key,
 };
 use crate::state::{
-    ttl_heartbeat_delay, MaterializedStateStore, StateChange, StateEntry, StateOperation,
-    StateStore, StateStorePolicy,
+    MaterializedStateStore, StateChange, StateEntry, StateOperation, StateStore, StateStorePolicy,
 };
 use crate::{Error, Result};
+
+mod managed;
+pub use managed::{AdvertisementContent, AdvertisementState, ManagedAdvertisement};
 
 pub const BEACON_ADVERTISEMENT_SCHEMA_ID: &str = "dev.deckr.beacon.advertisement.v1";
 pub const DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME: &str = "deckr_beacon_advertisement_v1";
@@ -48,7 +51,7 @@ pub struct BeaconProtocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdvertisementRecord {
     #[serde(default = "advertisement_schema_id", rename = "schema")]
     pub schema_id: String,
@@ -108,6 +111,15 @@ impl AdvertisementRecord {
             return Err(Error::Invalid(
                 "ttlSeconds must be greater than zero".to_string(),
             ));
+        }
+        if let Some(protocol) = &self.protocol {
+            require_text(&protocol.namespace, "Beacon protocol namespace")?;
+            require_text(&protocol.version, "Beacon protocol version")?;
+        }
+        for timestamp in [&self.created_at, &self.updated_at].into_iter().flatten() {
+            chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+                Error::Invalid("Beacon timestamp must be an RFC 3339 datetime".into())
+            })?;
         }
         for operation in &self.operations {
             require_text(operation, "Beacon operation")?;
@@ -183,6 +195,7 @@ pub struct BeaconAdvertiser<S: StateStore> {
     labels: BTreeMap<String, String>,
     hints: BTreeMap<String, Value>,
     payload: Option<Value>,
+    clock: Arc<dyn crate::lifecycle::Clock>,
 }
 
 #[derive(Clone)]
@@ -310,7 +323,19 @@ impl<S: StateStore> BeaconAdvertiser<S> {
             labels: BTreeMap::new(),
             hints: BTreeMap::new(),
             payload: None,
+            clock: Arc::new(crate::lifecycle::SystemClock),
         }
+    }
+
+    pub fn clock(mut self, clock: Arc<dyn crate::lifecycle::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Own publication, TTL-derived renewal, recovery, and guarded withdrawal.
+    /// Requires a Tokio runtime. The returned state initially reports starting.
+    pub fn manage(self) -> Result<ManagedAdvertisement> {
+        ManagedAdvertisement::start(self)
     }
 
     pub fn advertisement_id(mut self, advertisement_id: impl Into<String>) -> Self {
@@ -375,7 +400,7 @@ impl<S: StateStore> BeaconAdvertiser<S> {
             .await
         {
             Ok(entry) => entry,
-            Err(Error::StateConflict(_)) => {
+            Err(error) if error.is_state_conflict() => {
                 let current = self.state.get(&key).await?;
                 let Some(current) = current else {
                     let next_refresh_at = self.next_refresh_deadline(record.ttl_seconds);
@@ -394,7 +419,7 @@ impl<S: StateStore> BeaconAdvertiser<S> {
                     )));
                 }
                 let refreshed = self.record(
-                    current_record.refresh_seq + 1,
+                    next_refresh_seq(current_record.refresh_seq)?,
                     ttl_seconds,
                     current_record.created_at,
                 );
@@ -434,7 +459,7 @@ impl<S: StateStore> BeaconAdvertiser<S> {
         }
         let desired = self.record(1, ttl_seconds, current_record.created_at.clone());
         if advertisement_content_matches(&current_record, &desired)
-            && Instant::now() < handle.next_refresh_at
+            && self.clock.now() < handle.next_refresh_at
         {
             return Ok(advertisement_handle(
                 handle.key.clone(),
@@ -444,9 +469,9 @@ impl<S: StateStore> BeaconAdvertiser<S> {
             ));
         }
         let refreshed = self.record(
-            current_record.refresh_seq + 1,
+            next_refresh_seq(current_record.refresh_seq)?,
             ttl_seconds,
-            current_record.created_at.or_else(|| Some(now())),
+            current_record.created_at.or_else(|| Some(self.timestamp())),
         );
         let entry = self
             .state
@@ -502,7 +527,7 @@ impl<S: StateStore> BeaconAdvertiser<S> {
             }
             match self.state.delete(&entry.key, Some(entry.revision)).await {
                 Ok(()) => removed += 1,
-                Err(Error::StateConflict(_)) => continue,
+                Err(error) if error.is_state_conflict() => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -522,7 +547,20 @@ impl<S: StateStore> BeaconAdvertiser<S> {
     }
 
     fn next_refresh_deadline(&self, ttl_seconds: u64) -> Instant {
-        Instant::now() + ttl_heartbeat_delay(self.requested_refresh_interval, ttl_seconds)
+        let delay = crate::lifecycle::heartbeat_delay(self.clock.as_ref(), ttl_seconds);
+        let delay = match self.requested_refresh_interval {
+            Some(requested) => {
+                delay.max(requested.min(Duration::from_secs_f64(ttl_seconds as f64 * 0.75)))
+            }
+            None => delay,
+        };
+        self.clock.now() + delay
+    }
+
+    fn timestamp(&self) -> String {
+        self.clock
+            .utc_now()
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
     }
 
     fn record(
@@ -531,7 +569,7 @@ impl<S: StateStore> BeaconAdvertiser<S> {
         ttl_seconds: u64,
         created_at: Option<String>,
     ) -> AdvertisementRecord {
-        let now = now();
+        let now = self.timestamp();
         AdvertisementRecord {
             schema_id: BEACON_ADVERTISEMENT_SCHEMA_ID.to_string(),
             advertisement_id: self.advertisement_id.clone(),
@@ -730,6 +768,8 @@ fn require_text(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+fn next_refresh_seq(previous: u64) -> Result<u64> {
+    previous
+        .checked_add(1)
+        .ok_or_else(|| Error::StateConflict("Beacon refresh sequence exhausted".into()))
 }

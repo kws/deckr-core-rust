@@ -18,6 +18,36 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+#[path = "support/action_boundary.rs"]
+mod action_boundary;
+
+#[test]
+fn maintenance_records_match_upstream_examples() {
+    use deckr::concord::{StaleObservationRecord, TokenCleanupRecord};
+    for (directory, valid) in [("valid", true), ("invalid", false)] {
+        let stale = StaleObservationRecord::from_text(&artifact_text(&format!(
+            "fixtures/{directory}/coverage/protocols/concord/stale-observation.v1.json"
+        )));
+        assert_eq!(stale.is_ok(), valid);
+        let cleanup = TokenCleanupRecord::from_text(&artifact_text(&format!(
+            "fixtures/{directory}/coverage/protocols/concord/token-cleanup.v1.json"
+        )));
+        assert_eq!(cleanup.is_ok(), valid);
+        if valid {
+            let stale = stale.unwrap();
+            assert_eq!(
+                StaleObservationRecord::from_value(stale.to_value().unwrap()).unwrap(),
+                stale
+            );
+            let cleanup = cleanup.unwrap();
+            assert_eq!(
+                TokenCleanupRecord::from_value(cleanup.to_value().unwrap()).unwrap(),
+                cleanup
+            );
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct KeyTokenVectors {
     cases: Vec<KeyTokenCase>,
@@ -197,6 +227,311 @@ fn artifact_path(path: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deckr"));
     spec_dir.join("contract/v1").join(path)
+}
+
+#[test]
+fn messaging_models_follow_upstream_coverage_examples() {
+    for name in [
+        "messaging/message",
+        "services/message",
+        "hardware/messages",
+        "hardware/messages/control-input",
+        "hardware/messages/control-command",
+        "hardware/messages/command-accepted",
+        "hardware/messages/command-rejected",
+        "hardware/messages/command-reply",
+        "hardware/messages/capability-state-request",
+        "hardware/messages/capability-state-reply",
+        "hardware/messages/capability-state-changed",
+    ] {
+        for valid in [true, false] {
+            let path = format!(
+                "fixtures/{}/coverage/deckr/{name}.v1.json",
+                if valid { "valid" } else { "invalid" }
+            );
+            assert_eq!(
+                DeckrMessage::from_text(&artifact_text(&path)).is_ok(),
+                valid,
+                "{path}"
+            );
+        }
+    }
+    for name in ["endpoint-target", "broadcast-target"] {
+        for valid in [true, false] {
+            let path = format!(
+                "fixtures/{}/coverage/deckr/messaging/{name}.v1.json",
+                if valid { "valid" } else { "invalid" }
+            );
+            let accepted =
+                serde_json::from_str::<deckr::lanes::MessageTarget>(&artifact_text(&path))
+                    .is_ok_and(|target| target.validate().is_ok());
+            assert_eq!(accepted, valid, "{path}");
+        }
+    }
+}
+
+#[test]
+fn hardware_descriptor_models_follow_upstream_coverage_examples() {
+    use deckr::lanes::*;
+    use deckr::profiles::hardware::*;
+    macro_rules! check {
+        ($kind:ty, $name:literal) => {
+            for valid in [true, false] {
+                let path = format!(
+                    "fixtures/{}/coverage/deckr/hardware/{}.v1.json",
+                    if valid { "valid" } else { "invalid" },
+                    $name
+                );
+                let text = artifact_text(&path);
+                let accepted = serde_json::from_str::<$kind>(&text)
+                    .is_ok_and(|value| value.validate().is_ok());
+                assert_eq!(accepted, valid, "{path}");
+            }
+        };
+    }
+    check!(DeviceDescriptor, "device-descriptor");
+    check!(ControlDescriptor, "control-descriptor");
+    check!(CapabilityDescriptor, "capability-descriptor");
+    check!(DeviceConnection, "device-connection");
+    check!(DeviceIdentifier, "device-identifier");
+    check!(DeviceSourceReference, "device-source-reference");
+    check!(DescriptorCapabilityRef, "descriptor-capability-ref");
+    check!(ControlRef, "control-ref");
+    check!(CapabilityProjection, "capability-projection");
+    check!(CapabilityUnit, "capability-unit");
+    check!(CapabilityConstraint, "capability-constraint");
+    check!(CapabilitySchema, "capability-schema");
+    check!(ControlGeometry, "control-geometry");
+    check!(DeviceRef, "device-ref");
+    check!(ProfileCapacity, "profile-capacity");
+    check!(HardwareAdvertisementDevice, "hardware-advertisement-device");
+    check!(HardwareBeaconPayload, "advertisement-payload");
+    check!(HardwareClaimDevice, "hardware-claim-device");
+    check!(HardwareClaimTerms, "claim-terms");
+}
+
+#[test]
+fn service_declaration_models_follow_upstream_coverage_examples() {
+    use deckr::services::*;
+    macro_rules! check {
+        ($kind:ty, $name:literal) => {
+            for valid in [true, false] {
+                let path = format!(
+                    "fixtures/{}/coverage/deckr/services/{}.v1.json",
+                    if valid { "valid" } else { "invalid" },
+                    $name
+                );
+                let accepted = serde_json::from_str::<$kind>(&artifact_text(&path))
+                    .is_ok_and(|value| value.validate().is_ok());
+                assert_eq!(accepted, valid, "{path}");
+            }
+        };
+    }
+    check!(ServiceProtocol, "protocol-definition");
+    check!(ServiceMessageDefinition, "service-message-definition");
+    check!(ServiceOperationDefinition, "service-operation-definition");
+    check!(ServicePayloadSchema, "service-payload-schema");
+    check!(
+        ServiceViewFamilyDefinition,
+        "service-view-family-definition"
+    );
+    check!(ServiceViewFamily, "service-view-family");
+    check!(ServiceViewRef, "view-ref");
+    check!(ServiceViewRecord, "view-record");
+    check!(ServiceAdvertisementPayload, "service-advertisement-payload");
+    check!(ServiceMessageBody, "service-message-body");
+    check!(ServiceError, "service-error");
+    for valid in [true, false] {
+        let path = format!(
+            "fixtures/{}/coverage/deckr/services/use-contract.v1.json",
+            if valid { "valid" } else { "invalid" }
+        );
+        let value: Value = artifact(&path);
+        let accepted = ContractRecord::from_value(value.clone()).is_ok_and(|record| {
+            let Some(service) = record
+                .participants
+                .iter()
+                .find(|participant| participant.family() == "service")
+            else {
+                return false;
+            };
+            let Some(consumer) = record
+                .participants
+                .iter()
+                .find(|participant| *participant != service)
+            else {
+                return false;
+            };
+            let Some(profile) = record.profile.as_deref() else {
+                return false;
+            };
+            validate_service_use_record(&value, service, consumer, profile).is_ok()
+        });
+        assert_eq!(accepted, valid, "{path}");
+    }
+}
+
+#[test]
+fn service_view_keys_match_upstream_vectors() {
+    use deckr::services::{service_view_key, service_view_storage_key};
+    let vectors: Value = artifact("vectors/service-view-keys.v1.json");
+    for case in vectors["cases"].as_array().unwrap() {
+        let view_key = service_view_key(
+            case["serviceId"].as_str().unwrap(),
+            case["family"].as_str().unwrap(),
+            &[case["token"].as_str().unwrap()],
+        );
+        assert_eq!(view_key, case["viewKey"]);
+        assert_eq!(
+            service_view_storage_key(
+                &view_key,
+                case["contractId"].as_str().unwrap(),
+                case["generation"].as_u64().unwrap()
+            )
+            .unwrap(),
+            case["storageKey"]
+        );
+    }
+}
+
+#[test]
+fn service_catalog_compiles_with_upstream_resources_and_validates_its_payloads() {
+    use deckr::schema::SchemaRegistry;
+    use deckr::services::*;
+    let protocol =
+        ServiceProtocol::from_text(&artifact_text("catalogs/action-runtime-protocol.v1.json"))
+            .unwrap();
+    deckr::action_runtime::validate_action_runtime_protocol(&protocol).unwrap();
+    let mut registry = SchemaRegistry::default();
+    let mut pending = vec![artifact_path("schemas")];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let schema: Value =
+                    serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                if let Some(id) = schema.get("$id").and_then(Value::as_str) {
+                    registry = registry.with_resource(id.to_string(), schema).unwrap();
+                }
+            }
+        }
+    }
+    let validated = ValidatedServiceProtocol::new(protocol.clone(), &registry).unwrap();
+    for (name, definition) in &protocol.messages {
+        let path = format!(
+            "fixtures/valid/coverage/deckr/action-runtime/messages/{}.v1.json",
+            name.replace('_', "-")
+        );
+        let message = DeckrMessage::from_text(&artifact_text(&path)).unwrap();
+        validated
+            .validate_message(
+                &message.service_body().unwrap(),
+                definition.direction,
+                ServiceMessageKind::Initial,
+            )
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+    }
+}
+
+#[test]
+fn action_runtime_models_validate_upstream_positive_and_negative_examples() {
+    use deckr::action_runtime::*;
+    fn check<T: ActionModel>(name: &str) {
+        for (directory, valid) in [("valid", true), ("invalid", false)] {
+            let path = format!("fixtures/{directory}/coverage/deckr/action-runtime/{name}.v1.json");
+            let parsed = T::from_text(&artifact_text(&path));
+            assert_eq!(parsed.is_ok(), valid, "{path}: {:?}", parsed.err());
+            if valid {
+                let model = T::from_text(&artifact_text(&path)).unwrap();
+                T::from_value(model.to_value().unwrap()).unwrap();
+            }
+        }
+    }
+    check::<ActionDescriptor>("action-descriptor");
+    check::<ActionAvailabilityEntry>("action-availability-entry");
+    check::<ActionAvailabilitySelector>("action-availability-selector");
+    check::<ActionAvailabilityPayload>("availability-payload");
+    check::<ActionInstanceMetadata>("action-instance-metadata");
+    check::<ActionInstanceLifecycle>("action-instance-lifecycle-body");
+    check::<ActionLifecycleRejected>("action-lifecycle-rejected-body");
+    check::<BindingMetadata>("binding-metadata");
+    check::<BindingAttached>("binding-attached-body");
+    check::<BindingDetached>("binding-detached-body");
+    check::<BindingOutput>("binding-output-body");
+    check::<BindingOverlay>("binding-overlay-body");
+    check::<BindingOverlayClear>("binding-overlay-clear-body");
+    check::<CapabilityInput>("capability-input-body");
+    check::<CapabilityInputEvent>("capability-input-event");
+    check::<CapabilityRequirement>("capability-requirement");
+    check::<CapabilityRequirementSelector>("capability-requirement-selector");
+    check::<MatchedCapability>("matched-capability");
+    check::<DynamicPageCommand>("dynamic-page-command");
+    check::<DynamicPageBody>("open-page-body");
+    check::<DynamicPageBody>("replace-page-body");
+    check::<PageChildBindingDescriptor>("page-child-binding-descriptor");
+    check::<PageChildBindingTarget>("page-child-binding-target");
+    check::<PageSessionMetadata>("page-session-metadata");
+    check::<PageSessionLifecycle>("page-session-lifecycle-body");
+    check::<SettingsTargetRef>("settings-target-ref");
+    check::<SettingsTargetDescription>("settings-target-description");
+    check::<SettingsSchemaMetadata>("settings-schema-metadata");
+    check::<SettingsSnapshot>("settings-snapshot");
+    check::<EmptyActionBody>("empty-action-body");
+}
+
+#[test]
+fn action_runtime_message_shapes_and_settings_keys_follow_upstream_contracts() {
+    use deckr::action_runtime::*;
+    let declaration: Value = artifact("catalogs/action-runtime-protocol.v1.json");
+    for (name, definition) in declaration["messages"].as_object().unwrap() {
+        for (directory, valid) in [("valid", true), ("invalid", false)] {
+            let path = format!(
+                "fixtures/{directory}/coverage/deckr/action-runtime/messages/{}.v1.json",
+                name.replace('_', "-")
+            );
+            let parsed = DeckrMessage::from_text(&artifact_text(&path))
+                .and_then(|message| ActionMessage::from_envelope(&message));
+            assert_eq!(parsed.is_ok(), valid, "{path}: {:?}", parsed.as_ref().err());
+            if let Ok(action) = parsed {
+                assert_eq!(action.name(), name);
+                assert_eq!(
+                    serde_json::to_value(action.direction()).unwrap(),
+                    definition["direction"]
+                );
+                assert_eq!(
+                    ActionMessage::from_body(&action.to_body().unwrap()).unwrap(),
+                    action
+                );
+            }
+        }
+    }
+    let vectors: Value = artifact("vectors/settings-target-keys.v1.json");
+    for case in vectors["cases"].as_array().unwrap() {
+        assert_eq!(
+            SettingsTargetRef::from_value(case["target"].clone())
+                .unwrap()
+                .key()
+                .unwrap(),
+            case["key"]
+        );
+    }
+    for (directory, valid) in [("valid", true), ("invalid", false)] {
+        let path =
+            format!("fixtures/{directory}/coverage/deckr/action-runtime/availability-view.v1.json");
+        let parsed = ActionAvailabilityRecord::from_text(&artifact_text(&path));
+        assert_eq!(parsed.is_ok(), valid, "{path}: {:?}", parsed.as_ref().err());
+        if let Ok(record) = parsed {
+            assert_eq!(
+                ActionAvailabilityRecord::from_value(record.to_value().unwrap()).unwrap(),
+                record
+            );
+        }
+    }
 }
 
 fn artifact_text(path: &str) -> String {
