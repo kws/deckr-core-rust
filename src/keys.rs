@@ -86,7 +86,7 @@ pub fn parse_concord_participant_token_key(key: &str) -> Option<(String, u64, En
     Some((
         decode_key_token(parts[1]).ok()?,
         parts[2].parse().ok()?,
-        EndpointAddress::parse(decode_key_token(parts[4]).ok()?).ok()?,
+        EndpointAddress::parse_protocol(decode_key_token(parts[4]).ok()?).ok()?,
     ))
 }
 
@@ -100,10 +100,6 @@ pub fn concord_contract_prefix(contract_id: &str, generation: u64) -> String {
 
 pub fn concord_contracts_prefix() -> &'static str {
     "contracts."
-}
-
-pub fn service_use_scope_index_key(scope_id: &str) -> String {
-    format!("scopes.{}", encode_key_token(scope_id))
 }
 
 fn is_safe_token(raw: &str) -> bool {

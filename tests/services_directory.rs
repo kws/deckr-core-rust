@@ -7,8 +7,9 @@ use deckr::beacon::{
 };
 use deckr::endpoint::{service_address, EndpointAddress};
 use deckr::services::{
-    parse_service_descriptor, service_use_terms, service_view_prefix, ServiceBackendStatus,
-    ServiceDirectory, ServiceProtocol, ServiceQuery, ServiceResolver, ServiceViewFamilyDefinition,
+    parse_service_descriptor, service_access, service_use_contract, service_view_prefix,
+    ServiceBackendStatus, ServiceDirectory, ServiceProtocol, ServiceQuery, ServiceResolver,
+    ServiceViewFamilyDefinition,
 };
 use deckr::state::{MemoryStateStore, StateStore};
 use futures_util::StreamExt;
@@ -43,7 +44,7 @@ async fn service_descriptor_parsing_validates_protocol_identity() {
 }
 
 #[tokio::test]
-async fn service_use_scope_id_includes_namespace() {
+async fn service_use_contract_omits_terms_and_keeps_access_policy_local() {
     let state = MemoryStateStore::ttl_bound(DEFAULT_BEACON_TTL_SECONDS).unwrap();
     let beacon = Beacon::start(state.clone()).await.unwrap();
     let protocol = service_protocol(SERVICE_ID);
@@ -53,15 +54,35 @@ async fn service_use_scope_id_includes_namespace() {
     let candidate = beacon.candidates(&protocol.feature_id).unwrap()[0].clone();
     let descriptor = parse_service_descriptor(&candidate, &protocol).unwrap();
     let client = EndpointAddress::parse("action_provider:test-provider").unwrap();
-    let terms = service_use_terms(&descriptor, &client, ["sendCommand"], BTreeMap::new()).unwrap();
+    let terms = service_access(&descriptor, ["sendCommand"], BTreeMap::new()).unwrap();
     let mut other_namespace = descriptor.clone();
     other_namespace.namespace = "dev.deckr.other.service".to_string();
-    let other_terms =
-        service_use_terms(&other_namespace, &client, ["sendCommand"], BTreeMap::new()).unwrap();
+    let other_terms = service_access(&other_namespace, ["sendCommand"], BTreeMap::new()).unwrap();
 
     assert_eq!(terms.service_namespace, "dev.deckr.openhab.service");
     assert_eq!(other_terms.service_namespace, "dev.deckr.other.service");
-    assert_ne!(terms.service_use_scope_id, other_terms.service_use_scope_id);
+    assert_ne!(terms, other_terms);
+    let spec = service_use_contract(&descriptor, &client, "client-session").unwrap();
+    assert!(spec.terms.is_none());
+    assert!(spec.contract_id.is_none());
+    assert_eq!(spec.generation, 1);
+    assert_eq!(spec.participants.len(), 2);
+    let concord = deckr::concord::ConcordCoordinator::new(
+        MemoryStateStore::new(),
+        MemoryStateStore::ttl_bound(120).unwrap(),
+    );
+    let first = concord.create_contract(spec.clone()).await.unwrap();
+    let second = concord.create_contract(spec).await.unwrap();
+    assert_ne!(first.contract_id, second.contract_id);
+    let wire = concord
+        .contract_record(&first)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_value()
+        .unwrap();
+    assert!(wire.get("terms").is_none());
+    assert!(wire.get("termsHash").is_none());
 }
 
 #[tokio::test]

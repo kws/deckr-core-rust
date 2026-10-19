@@ -25,6 +25,17 @@ pub const DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME: &str = "deckr_beacon_advertis
 pub const DEFAULT_BEACON_TTL_SECONDS: u64 = 300;
 pub const BEACON_ADVERTISEMENT_PREFIX: &str = "advertisements.";
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeaconSnapshot {
+    pub version: u64,
+    pub current: bool,
+    pub closed: bool,
+    pub candidates: Vec<Candidate>,
+    pub changed: std::collections::BTreeSet<String>,
+    pub resnapshot_required: bool,
+}
+pub type BeaconStateWatch = Pin<Box<dyn Stream<Item = BeaconSnapshot> + Send>>;
+
 pub fn beacon_advertisement_store_policy() -> StateStorePolicy {
     StateStorePolicy::ttl(DEFAULT_BEACON_TTL_SECONDS, "Beacon advertisement state")
         .expect("default Beacon TTL should be valid")
@@ -43,7 +54,9 @@ pub struct AdvertisementRecord {
     pub schema_id: String,
     pub advertisement_id: String,
     pub feature_id: String,
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::endpoint")]
     pub advertiser: EndpointAddress,
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::endpoint")]
     pub endpoint: EndpointAddress,
     pub session_id: String,
     pub refresh_seq: u64,
@@ -225,25 +238,12 @@ impl<S: StateStore> Beacon<S> {
 
     pub fn watch(&self, feature_id: &str) -> Result<BeaconFeatureWatchStream> {
         require_text(feature_id, "Beacon feature id")?;
-        let changes = self.advertisements.subscribe_cached();
-        let initial_candidates = self.candidates(feature_id)?;
-        let known = initial_candidates
-            .iter()
-            .map(|candidate| (candidate.key.clone(), candidate.clone()))
-            .collect::<BTreeMap<_, _>>();
-        let initial_events = initial_candidates
-            .into_iter()
-            .map(|candidate| {
-                Ok(BeaconFeatureEvent {
-                    event_type: BeaconFeatureEventType::Advertised,
-                    feature_id: candidate.advertisement.feature_id.clone(),
-                    key: candidate.key.clone(),
-                    candidate: Some(candidate),
-                    previous: None,
-                    reason: None,
-                })
-            })
-            .collect::<Vec<_>>();
+        let changes = crate::state::snapshot_changes(
+            self.advertisements
+                .watch_snapshots(&beacon_feature_prefix(feature_id))?,
+            true,
+        );
+        let known = BTreeMap::new();
         let feature_id = feature_id.to_string();
         let live = stream::unfold(
             (changes, known, feature_id),
@@ -262,7 +262,31 @@ impl<S: StateStore> Beacon<S> {
                 }
             },
         );
-        Ok(Box::pin(stream::iter(initial_events).chain(live)))
+        Ok(Box::pin(live))
+    }
+
+    /// Canonical bounded current-state watch. `watch` is the legacy event adapter.
+    pub fn watch_state(&self, feature_id: &str) -> Result<BeaconStateWatch> {
+        require_text(feature_id, "Beacon feature id")?;
+        let feature_id = feature_id.to_string();
+        let watch = self
+            .advertisements
+            .watch_snapshots(&beacon_feature_prefix(&feature_id))?;
+        Ok(Box::pin(watch.map(move |snapshot| {
+            BeaconSnapshot {
+                version: snapshot.version,
+                current: snapshot.current,
+                closed: snapshot.closed,
+                candidates: snapshot
+                    .entries
+                    .into_iter()
+                    .filter_map(candidate_from_entry)
+                    .filter(|candidate| candidate.advertisement.feature_id == feature_id)
+                    .collect(),
+                changed: snapshot.changed,
+                resnapshot_required: snapshot.resnapshot_required,
+            }
+        })))
     }
 }
 

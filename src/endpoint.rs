@@ -28,6 +28,28 @@ pub struct EndpointAddress {
 
 impl EndpointAddress {
     pub fn parse(value: impl AsRef<str>) -> Result<Self> {
+        let endpoint = Self::parse_protocol(value)?;
+        let family = endpoint.family();
+        let endpoint_id = endpoint.endpoint_id();
+        if !CORE_ENDPOINT_FAMILIES.contains(&family) {
+            return Err(Error::Invalid(format!(
+                "unsupported endpoint family {family:?}"
+            )));
+        }
+        if family == ACTION_PROVIDER_FAMILY
+            && (!is_provider_instance_id(endpoint_id)
+                || RESERVED_ACTION_PROVIDER_INSTANCE_IDS.contains(&endpoint_id))
+        {
+            return Err(Error::Invalid(format!(
+                "invalid action provider endpoint id {endpoint_id:?}"
+            )));
+        }
+        Ok(endpoint)
+    }
+
+    /// Application-neutral Beacon/Concord endpoint syntax. Deckr callers use
+    /// `parse`, which additionally applies the Deckr endpoint policy.
+    pub fn parse_protocol(value: impl AsRef<str>) -> Result<Self> {
         let value = value.as_ref();
         if value.trim() != value {
             return Err(Error::Invalid(
@@ -39,24 +61,20 @@ impl EndpointAddress {
                 "endpoint address must use <family>:<id>".to_string(),
             ));
         };
-        if !CORE_ENDPOINT_FAMILIES.contains(&family) {
-            return Err(Error::Invalid(format!(
-                "unsupported endpoint family {family:?}"
-            )));
+        if !family.starts_with(|ch: char| ch.is_ascii_lowercase())
+            || !family
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-'))
+        {
+            return Err(Error::Invalid(
+                "protocol endpoint family must be a lowercase token".into(),
+            ));
         }
         if endpoint_id.is_empty() || endpoint_id.trim() != endpoint_id || endpoint_id.contains(':')
         {
             return Err(Error::Invalid(
                 "endpoint id must be non-empty, trimmed, and must not contain ':'".to_string(),
             ));
-        }
-        if family == ACTION_PROVIDER_FAMILY
-            && (!is_provider_instance_id(endpoint_id)
-                || RESERVED_ACTION_PROVIDER_INSTANCE_IDS.contains(&endpoint_id))
-        {
-            return Err(Error::Invalid(format!(
-                "invalid action provider endpoint id {endpoint_id:?}"
-            )));
         }
         Ok(Self {
             address: value.to_string(),
@@ -75,6 +93,31 @@ impl EndpointAddress {
 
     pub fn as_str(&self) -> &str {
         &self.address
+    }
+}
+
+pub(crate) mod protocol_serde {
+    use super::*;
+    pub fn endpoint<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<EndpointAddress, D::Error> {
+        EndpointAddress::parse_protocol(String::deserialize(deserializer)?)
+            .map_err(D::Error::custom)
+    }
+    pub fn endpoints<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<EndpointAddress>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|value| EndpointAddress::parse_protocol(value).map_err(D::Error::custom))
+            .collect()
+    }
+    pub fn optional<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<EndpointAddress>, D::Error> {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| EndpointAddress::parse_protocol(value).map_err(D::Error::custom))
+            .transpose()
     }
 }
 

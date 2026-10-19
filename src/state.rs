@@ -2,14 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env::{self, VarError};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
 use futures_core::Stream;
+use futures_util::task::AtomicWaker;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -188,6 +191,16 @@ pub struct StateChange {
 
 pub type StateWatchStream = Pin<Box<dyn Stream<Item = Result<StateChange>> + Send + 'static>>;
 
+/// A recovered snapshot with its captured high-water barrier. Changes observed
+/// during replay beyond that barrier are installed atomically with the snapshot.
+/// Adapters must expose watch failure/recovery, never silently bridge a gap.
+pub struct StateSource {
+    pub entries: Vec<StateEntry>,
+    pub revision: u64,
+    pub replayed: Vec<StateChange>,
+    pub changes: StateWatchStream,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PrefixObservation {
     pub entries: Vec<StateEntry>,
@@ -220,6 +233,32 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<StateEntry>> + Send;
     fn delete(&self, key: &str, revision: Option<u64>) -> impl Future<Output = Result<()>> + Send;
     fn watch(&self, prefix: &str) -> impl Future<Output = Result<StateWatchStream>> + Send;
+
+    fn open_source(&self, _prefix: &str) -> impl Future<Output = Result<StateSource>> + Send {
+        async {
+            Err(Error::Unsupported(
+                "store requires an atomic snapshot/watch adapter".into(),
+            ))
+        }
+    }
+
+    fn delete_revision(
+        &self,
+        _key: &str,
+        _revision: Option<u64>,
+    ) -> impl Future<Output = Result<u64>> + Send {
+        async {
+            Err(Error::Unsupported(
+                "store requires committed delete revisions".into(),
+            ))
+        }
+    }
+
+    /// Changes permanently on any loss of source continuity. Raw exact stores
+    /// have no materialized source and use epoch zero.
+    fn authority_epoch(&self) -> Option<u64> {
+        Some(0)
+    }
 }
 
 pub async fn observe_prefix_current<S: StateStore>(
@@ -250,7 +289,9 @@ pub async fn observe_prefix_current<S: StateStore>(
     })
 }
 
-const MAX_MATERIALIZED_SUBSCRIBERS: usize = 128;
+const MAX_MATERIALIZED_SUBSCRIBERS: usize = 256;
+const MAX_CHANGED_IDENTITIES: usize = 256;
+const MAX_ABSENT_REVISIONS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -261,271 +302,377 @@ pub enum MaterializedStateStatus {
     Closed,
 }
 
+/// Immutable current state. Change detail is bounded; membership is complete.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateSnapshot {
+    pub version: u64,
+    pub source_generation: u64,
+    pub current: bool,
+    pub closed: bool,
+    pub entries: Vec<StateEntry>,
+    pub changed: BTreeSet<String>,
+    pub resnapshot_required: bool,
+}
+
+struct SnapshotSubscription {
+    pending: Mutex<Option<StateSnapshot>>,
+    interruption: Mutex<Option<StateSnapshot>>,
+    waker: AtomicWaker,
+    prefix: String,
+}
+
+pub struct StateSnapshotWatch {
+    subscription: Arc<SnapshotSubscription>,
+    initial: Option<StateSnapshot>,
+    done: bool,
+}
+impl Stream for StateSnapshotWatch {
+    type Item = StateSnapshot;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        if let Some(initial) = self.initial.take() {
+            self.done = initial.closed;
+            return Poll::Ready(Some(initial));
+        }
+        self.subscription.waker.register(cx.waker());
+        let interruption = self
+            .subscription
+            .interruption
+            .lock()
+            .expect("snapshot lock poisoned")
+            .take();
+        if let Some(snapshot) = interruption {
+            {
+                let mut pending = self
+                    .subscription
+                    .pending
+                    .lock()
+                    .expect("snapshot lock poisoned");
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.version <= snapshot.version)
+                {
+                    pending.take();
+                }
+            }
+            self.done = snapshot.closed;
+            return Poll::Ready(Some(snapshot));
+        }
+        let snapshot = self
+            .subscription
+            .pending
+            .lock()
+            .expect("snapshot lock poisoned")
+            .take();
+        if let Some(snapshot) = snapshot {
+            self.done = snapshot.closed;
+            return Poll::Ready(Some(snapshot));
+        }
+        Poll::Pending
+    }
+}
+
 #[derive(Clone)]
 pub struct MaterializedStateStore<S: StateStore> {
     state: S,
     prefix: String,
     inner: Arc<Mutex<MaterializedStateInner>>,
-    watch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    owner: Arc<SourceOwner>,
 }
-
-#[derive(Debug)]
+struct SourceOwner {
+    task: Mutex<Option<JoinHandle<()>>>,
+    inner: Arc<Mutex<MaterializedStateInner>>,
+}
+impl Drop for SourceOwner {
+    fn drop(&mut self) {
+        self.inner
+            .lock()
+            .expect("source lock poisoned")
+            .set_status(MaterializedStateStatus::Closed);
+        if let Some(task) = self.task.get_mut().expect("task lock poisoned").take() {
+            task.abort();
+        }
+    }
+}
 struct MaterializedStateInner {
     status: MaterializedStateStatus,
     entries: BTreeMap<String, StateEntry>,
     revision_by_key: BTreeMap<String, u64>,
+    barrier: u64,
     generation: u64,
-    subscribers: Vec<UnboundedSender<Result<StateChange>>>,
+    authority_epoch: u64,
+    subscribers: Vec<Weak<SnapshotSubscription>>,
+    changed: Arc<Notify>,
 }
 
 impl<S: StateStore> MaterializedStateStore<S> {
     pub async fn start(state: S, prefix: impl Into<String>) -> Result<Self> {
         let prefix = prefix.into();
-        let mut watch = state.watch(&prefix).await?;
-        let entries = state
-            .items(&prefix)
-            .await?
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let revision_by_key = entries
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.revision))
-            .collect();
+        let source = state.open_source(&prefix).await?;
         let inner = Arc::new(Mutex::new(MaterializedStateInner {
-            status: MaterializedStateStatus::Ready,
-            entries,
-            revision_by_key,
+            status: MaterializedStateStatus::Starting,
+            entries: BTreeMap::new(),
+            revision_by_key: BTreeMap::new(),
+            barrier: 0,
             generation: 0,
+            authority_epoch: 0,
             subscribers: Vec::new(),
+            changed: Arc::new(Notify::new()),
         }));
+        inner
+            .lock()
+            .expect("source lock poisoned")
+            .install_snapshot(&source);
         let watch_inner = inner.clone();
-        let watch_prefix = prefix.clone();
         let watch_state = state.clone();
-        let watch_task = tokio::spawn(async move {
+        let watch_prefix = prefix.clone();
+        let task = tokio::spawn(async move {
+            let mut changes = source.changes;
             loop {
-                let retry = match watch.next().await {
-                    Some(Ok(change)) => {
-                        let mut inner = watch_inner
-                            .lock()
-                            .expect("materialized state mutex poisoned");
+                while let Some(change) = changes.next().await {
+                    let mut inner = watch_inner.lock().expect("source lock poisoned");
+                    if let Ok(change) = change {
                         inner.apply_change(change);
-                        false
+                        if inner
+                            .revision_by_key
+                            .len()
+                            .saturating_sub(inner.entries.len())
+                            < MAX_ABSENT_REVISIONS
+                        {
+                            continue;
+                        }
                     }
-                    Some(Err(error)) => {
-                        let mut inner = watch_inner
-                            .lock()
-                            .expect("materialized state mutex poisoned");
-                        inner.set_status(MaterializedStateStatus::Stale);
-                        inner.notify_error(error);
-                        true
-                    }
-                    None => {
-                        let mut inner = watch_inner
-                            .lock()
-                            .expect("materialized state mutex poisoned");
-                        inner.set_status(MaterializedStateStatus::Stale);
-                        inner.notify_error(Error::StateUnavailable(
-                            "materialized state watch ended".to_string(),
-                        ));
-                        true
-                    }
-                };
-                if !retry {
-                    continue;
+                    break;
                 }
-
+                watch_inner
+                    .lock()
+                    .expect("source lock poisoned")
+                    .set_status(MaterializedStateStatus::Stale);
+                // Drop the failed consumer before opening its replacement.
+                drop(changes);
                 loop {
-                    if watch_inner
-                        .lock()
-                        .expect("materialized state mutex poisoned")
-                        .status
-                        == MaterializedStateStatus::Closed
-                    {
-                        return;
-                    }
-                    time::sleep(Duration::from_secs(1)).await;
-                    match watch_state.watch(&watch_prefix).await {
-                        Ok(next_watch) => {
-                            watch = next_watch;
-                            match watch_state.items(&watch_prefix).await {
-                                Ok(entries) => {
-                                    let mut inner = watch_inner
-                                        .lock()
-                                        .expect("materialized state mutex poisoned");
-                                    inner.reconcile_snapshot(entries, &watch_prefix);
-                                    inner.set_status(MaterializedStateStatus::Ready);
-                                }
-                                Err(error) => {
-                                    let mut inner = watch_inner
-                                        .lock()
-                                        .expect("materialized state mutex poisoned");
-                                    inner.set_status(MaterializedStateStatus::Stale);
-                                    inner.notify_error(error);
-                                    continue;
-                                }
-                            }
+                    time::sleep(Duration::from_millis(100)).await;
+                    match watch_state.open_source(&watch_prefix).await {
+                        Ok(source) => {
+                            watch_inner
+                                .lock()
+                                .expect("source lock poisoned")
+                                .install_snapshot(&source);
+                            changes = source.changes;
                             break;
                         }
-                        Err(error) => {
-                            let mut inner = watch_inner
-                                .lock()
-                                .expect("materialized state mutex poisoned");
-                            inner.set_status(MaterializedStateStatus::Stale);
-                            inner.notify_error(error);
-                        }
+                        Err(_) => continue,
                     }
                 }
             }
+        });
+        let owner = Arc::new(SourceOwner {
+            task: Mutex::new(Some(task)),
+            inner: inner.clone(),
         });
         Ok(Self {
             state,
             prefix,
             inner,
-            watch_task: Arc::new(Mutex::new(Some(watch_task))),
+            owner,
         })
     }
 
     pub fn status(&self) -> MaterializedStateStatus {
-        self.inner
-            .lock()
-            .expect("materialized state mutex poisoned")
-            .status
+        self.inner.lock().expect("source lock poisoned").status
     }
-
     pub fn is_current(&self) -> bool {
         self.status() == MaterializedStateStatus::Ready
     }
-
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().expect("source lock poisoned").generation
+    }
+    pub fn snapshot(&self) -> StateSnapshot {
+        self.inner
+            .lock()
+            .expect("source lock poisoned")
+            .snapshot("", BTreeSet::new(), false)
+    }
+    pub fn authority_epoch(&self) -> Option<u64> {
+        let inner = self.inner.lock().expect("source lock poisoned");
+        (inner.status == MaterializedStateStatus::Ready).then_some(inner.authority_epoch)
+    }
     pub async fn wait_current(&self) -> Result<()> {
+        let notify = self
+            .inner
+            .lock()
+            .expect("source lock poisoned")
+            .changed
+            .clone();
         loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             match self.status() {
                 MaterializedStateStatus::Ready => return Ok(()),
                 MaterializedStateStatus::Closed => {
-                    return Err(Error::Closed(
-                        "materialized state store is closed".to_string(),
-                    ))
+                    return Err(Error::Closed("source closed".into()))
                 }
-                MaterializedStateStatus::Starting | MaterializedStateStatus::Stale => {
-                    time::sleep(Duration::from_millis(10)).await;
-                }
+                _ => notified.await,
             }
         }
     }
-
-    pub fn generation(&self) -> u64 {
+    pub fn close(&self) {
         self.inner
             .lock()
-            .expect("materialized state mutex poisoned")
-            .generation
-    }
-
-    pub fn close(&self) {
-        if let Some(task) = self
-            .watch_task
-            .lock()
-            .expect("materialized watch task mutex poisoned")
-            .take()
-        {
+            .expect("source lock poisoned")
+            .set_status(MaterializedStateStatus::Closed);
+        if let Some(task) = self.owner.task.lock().expect("task lock poisoned").as_ref() {
             task.abort();
         }
-        self.inner
-            .lock()
-            .expect("materialized state mutex poisoned")
-            .set_status(MaterializedStateStatus::Closed);
     }
-
+    pub async fn close_and_wait(&self) {
+        self.close();
+        let task = self.owner.task.lock().expect("task lock poisoned").take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
     pub fn get_cached(&self, key: &str) -> Result<Option<StateEntry>> {
-        let inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
+        let inner = self.inner.lock().expect("source lock poisoned");
         check_materialized_status(inner.status)?;
         Ok(inner.entries.get(key).cloned())
     }
-
     pub fn items_cached(&self, prefix: &str) -> Result<Vec<StateEntry>> {
-        let inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
+        let inner = self.inner.lock().expect("source lock poisoned");
         check_materialized_status(inner.status)?;
         Ok(inner
             .entries
-            .iter()
-            .filter_map(|(key, entry)| key.starts_with(prefix).then_some(entry.clone()))
+            .values()
+            .filter(|entry| entry.key.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+    pub fn cached_keys(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .items_cached("")?
+            .into_iter()
+            .map(|entry| entry.key)
             .collect())
     }
 
-    pub fn cached_keys(&self) -> Result<BTreeSet<String>> {
-        let inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
-        check_materialized_status(inner.status)?;
-        Ok(inner.entries.keys().cloned().collect())
-    }
-
-    pub fn subscribe_cached(&self) -> StateWatchStream {
-        let (sender, receiver) = unbounded();
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
+    /// Registers and captures the initial snapshot under the same state lock.
+    pub fn watch_snapshots(&self, prefix: &str) -> Result<StateSnapshotWatch> {
+        let mut inner = self.inner.lock().expect("source lock poisoned");
+        inner
+            .subscribers
+            .retain(|subscriber| subscriber.strong_count() > 0);
         if inner.subscribers.len() >= MAX_MATERIALIZED_SUBSCRIBERS {
-            inner.subscribers.remove(0);
+            return Err(Error::StateUnavailable(
+                "state watch registration limit (256) reached".into(),
+            ));
         }
-        inner.subscribers.push(sender);
-        Box::pin(receiver)
+        let initial = inner.snapshot(prefix, BTreeSet::new(), false);
+        let subscription = Arc::new(SnapshotSubscription {
+            pending: Mutex::new(None),
+            interruption: Mutex::new(None),
+            waker: AtomicWaker::new(),
+            prefix: prefix.into(),
+        });
+        inner.subscribers.push(Arc::downgrade(&subscription));
+        Ok(StateSnapshotWatch {
+            subscription,
+            initial: Some(initial),
+            done: false,
+        })
     }
 
+    /// Compatibility change adapter. New consumers should use watch_snapshots.
+    /// It diffs complete snapshots instead of retaining an unbounded event queue.
+    pub fn subscribe_cached(&self) -> StateWatchStream {
+        let watch = match self.watch_snapshots("") {
+            Ok(watch) => watch,
+            Err(error) => return Box::pin(futures_util::stream::once(async { Err(error) })),
+        };
+        snapshot_changes(watch, false)
+    }
+
+    /// Request repair without mutating the source from unordered exact reads.
     pub async fn reconcile_snapshot(
         &self,
         known_keys: impl IntoIterator<Item = String>,
     ) -> Result<PrefixObservation> {
-        let observation = observe_prefix_current(&self.state, &self.prefix, known_keys).await?;
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
-        inner.reconcile_snapshot(observation.entries.clone(), &self.prefix);
-        for key in &observation.confirmed_missing {
-            let revision = inner.revision_by_key.get(key).copied().unwrap_or(0) + 1;
-            inner.apply_change(StateChange {
-                operation: StateOperation::Delete,
-                key: key.clone(),
-                revision,
-                entry: None,
-            });
-        }
-        inner.set_status(MaterializedStateStatus::Ready);
-        Ok(observation)
+        observe_prefix_current(&self.state, &self.prefix, known_keys).await
     }
-
     pub async fn get_exact(&self, key: &str) -> Result<Option<StateEntry>> {
         self.state.get(key).await
     }
-
     pub async fn items_exact(&self, prefix: &str) -> Result<Vec<StateEntry>> {
         self.state.items(prefix).await
     }
-
     pub async fn ttl_seconds(&self) -> Result<Option<u64>> {
         self.state.ttl_seconds().await
     }
-
+    pub async fn wait_observed(&self, key: &str, revision: u64) -> Result<()> {
+        self.wait_observed_in_epoch(key, revision, self.authority_epoch())
+            .await
+    }
+    async fn wait_observed_in_epoch(
+        &self,
+        key: &str,
+        revision: u64,
+        epoch: Option<u64>,
+    ) -> Result<()> {
+        let notify = self
+            .inner
+            .lock()
+            .expect("source lock poisoned")
+            .changed
+            .clone();
+        let wait = async {
+            loop {
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let inner = self.inner.lock().expect("source lock poisoned");
+                    check_materialized_status(inner.status)?;
+                    if Some(inner.authority_epoch) != epoch {
+                        return Err(Error::MaterializedViewStale(
+                            "source continuity lost while waiting for a write".into(),
+                        ));
+                    }
+                    if inner.barrier >= revision
+                        || inner
+                            .revision_by_key
+                            .get(key)
+                            .is_some_and(|observed| *observed >= revision)
+                    {
+                        return Ok(());
+                    }
+                }
+                notified.await;
+            }
+        };
+        time::timeout(Duration::from_secs(5), wait)
+            .await
+            .map_err(|_| {
+                Error::StateUnavailable(
+                    "watch did not observe committed revision before deadline".into(),
+                )
+            })?
+    }
     pub async fn put(&self, key: &str, value: Value, ttl: Option<u64>) -> Result<StateEntry> {
+        let epoch = self.authority_epoch();
         let entry = self.state.put(key, value, ttl).await?;
-        self.apply_entry(entry.clone());
+        self.wait_observed_in_epoch(key, entry.revision, epoch)
+            .await?;
         Ok(entry)
     }
-
     pub async fn create(&self, key: &str, value: Value, ttl: Option<u64>) -> Result<StateEntry> {
+        let epoch = self.authority_epoch();
         let entry = self.state.create(key, value, ttl).await?;
-        self.apply_entry(entry.clone());
+        self.wait_observed_in_epoch(key, entry.revision, epoch)
+            .await?;
         Ok(entry)
     }
-
     pub async fn update(
         &self,
         key: &str,
@@ -533,117 +680,203 @@ impl<S: StateStore> MaterializedStateStore<S> {
         revision: u64,
         ttl: Option<u64>,
     ) -> Result<StateEntry> {
+        let epoch = self.authority_epoch();
         let entry = self.state.update(key, value, revision, ttl).await?;
-        self.apply_entry(entry.clone());
+        self.wait_observed_in_epoch(key, entry.revision, epoch)
+            .await?;
         Ok(entry)
     }
-
     pub async fn delete(&self, key: &str, revision: Option<u64>) -> Result<()> {
-        self.state.delete(key, revision).await?;
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("materialized state mutex poisoned");
-        let revision = inner.revision_by_key.get(key).copied().unwrap_or(0) + 1;
-        inner.apply_change(StateChange {
-            operation: StateOperation::Delete,
-            key: key.to_string(),
-            revision,
-            entry: None,
-        });
-        Ok(())
-    }
-
-    fn apply_entry(&self, entry: StateEntry) {
-        self.inner
-            .lock()
-            .expect("materialized state mutex poisoned")
-            .apply_change(StateChange {
-                operation: StateOperation::Put,
-                key: entry.key.clone(),
-                revision: entry.revision,
-                entry: Some(entry),
-            });
+        let epoch = self.authority_epoch();
+        let revision = self.state.delete_revision(key, revision).await?;
+        self.wait_observed_in_epoch(key, revision, epoch).await
     }
 }
 
 impl MaterializedStateInner {
+    fn snapshot(
+        &self,
+        prefix: &str,
+        changed: BTreeSet<String>,
+        resnapshot_required: bool,
+    ) -> StateSnapshot {
+        StateSnapshot {
+            version: self.generation,
+            source_generation: self.authority_epoch,
+            current: self.status == MaterializedStateStatus::Ready,
+            closed: self.status == MaterializedStateStatus::Closed,
+            entries: self
+                .entries
+                .values()
+                .filter(|entry| entry.key.starts_with(prefix))
+                .cloned()
+                .collect(),
+            changed,
+            resnapshot_required,
+        }
+    }
+    fn notify(&mut self, changed: BTreeSet<String>) {
+        self.generation += 1;
+        self.changed.notify_waiters();
+        self.subscribers
+            .retain(|subscriber| subscriber.strong_count() > 0);
+        for subscriber in self.subscribers.iter().filter_map(Weak::upgrade) {
+            let mut pending = subscriber.pending.lock().expect("snapshot lock poisoned");
+            let mut identities: BTreeSet<_> = changed
+                .iter()
+                .filter(|key| key.starts_with(&subscriber.prefix))
+                .cloned()
+                .collect();
+            let mut overflow = false;
+            if let Some(previous) = pending.as_ref() {
+                identities.extend(previous.changed.iter().cloned());
+                overflow = previous.resnapshot_required;
+            }
+            overflow |= identities.len() > MAX_CHANGED_IDENTITIES;
+            if overflow {
+                identities.clear();
+            }
+            let snapshot = self.snapshot(&subscriber.prefix, identities, overflow);
+            if !snapshot.current {
+                *subscriber
+                    .interruption
+                    .lock()
+                    .expect("snapshot lock poisoned") = Some(snapshot.clone());
+            }
+            *pending = Some(snapshot);
+            subscriber.waker.wake();
+        }
+    }
     fn set_status(&mut self, status: MaterializedStateStatus) {
-        if self.status == MaterializedStateStatus::Closed
-            && status != MaterializedStateStatus::Closed
-        {
+        if self.status == MaterializedStateStatus::Closed || self.status == status {
             return;
         }
+        if status != MaterializedStateStatus::Ready {
+            self.authority_epoch += 1;
+        }
         self.status = status;
+        self.notify(BTreeSet::new());
     }
-
+    fn install_snapshot(&mut self, source: &StateSource) {
+        if self.status == MaterializedStateStatus::Closed {
+            return;
+        }
+        let mut entries: BTreeMap<_, _> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.clone()))
+            .collect();
+        let mut revisions: BTreeMap<_, _> = entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.revision))
+            .collect();
+        for change in &source.replayed {
+            if change.revision <= source.revision
+                || change.revision <= revisions.get(&change.key).copied().unwrap_or(0)
+            {
+                continue;
+            }
+            revisions.insert(change.key.clone(), change.revision);
+            match &change.entry {
+                Some(entry) if change.operation == StateOperation::Put => {
+                    entries.insert(change.key.clone(), entry.clone());
+                }
+                _ => {
+                    entries.remove(&change.key);
+                }
+            }
+        }
+        let changed = self
+            .entries
+            .keys()
+            .chain(entries.keys())
+            .filter(|key| self.entries.get(*key) != entries.get(*key))
+            .cloned()
+            .collect();
+        self.revision_by_key = revisions;
+        self.entries = entries;
+        self.barrier = source.revision;
+        self.status = MaterializedStateStatus::Ready;
+        self.notify(changed);
+    }
     fn apply_change(&mut self, change: StateChange) {
-        let current_revision = self.revision_by_key.get(&change.key).copied().unwrap_or(0);
-        if change.revision <= current_revision {
+        if change.revision <= self.barrier
+            || change.revision <= self.revision_by_key.get(&change.key).copied().unwrap_or(0)
+        {
             return;
         }
         self.revision_by_key
             .insert(change.key.clone(), change.revision);
-        match change.operation {
-            StateOperation::Put => {
-                if let Some(entry) = &change.entry {
-                    self.entries.insert(change.key.clone(), entry.clone());
-                }
+        match change.entry {
+            Some(entry) if change.operation == StateOperation::Put => {
+                self.entries.insert(change.key.clone(), entry);
             }
-            StateOperation::Delete | StateOperation::Expire => {
+            _ => {
                 self.entries.remove(&change.key);
             }
         }
-        self.generation += 1;
-        self.notify(change);
+        self.notify(BTreeSet::from([change.key]));
     }
+}
 
-    fn reconcile_snapshot(&mut self, entries: Vec<StateEntry>, prefix: &str) {
-        let snapshot = entries
-            .into_iter()
-            .map(|entry| (entry.key.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let existing_keys = self
-            .entries
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
-            .collect::<Vec<_>>();
-        for key in existing_keys {
-            if snapshot.contains_key(&key) {
-                continue;
+pub(crate) fn snapshot_changes(
+    watch: StateSnapshotWatch,
+    include_initial: bool,
+) -> StateWatchStream {
+    Box::pin(futures_util::stream::unfold(
+        (
+            watch,
+            None::<BTreeMap<String, StateEntry>>,
+            std::collections::VecDeque::new(),
+        ),
+        move |(mut watch, mut previous, mut queued)| async move {
+            loop {
+                if let Some(change) = queued.pop_front() {
+                    return Some((Ok(change), (watch, previous, queued)));
+                }
+                let snapshot = watch.next().await?;
+                if !snapshot.current {
+                    return Some((
+                        Err(if snapshot.closed {
+                            Error::Closed("source closed".into())
+                        } else {
+                            Error::MaterializedViewStale("source stale".into())
+                        }),
+                        (watch, previous, queued),
+                    ));
+                }
+                let next: BTreeMap<_, _> = snapshot
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.key.clone(), entry))
+                    .collect();
+                if previous.is_some() || include_initial {
+                    let old = previous.take().unwrap_or_default();
+                    for (key, entry) in &next {
+                        if old.get(key) != Some(entry) {
+                            queued.push_back(StateChange {
+                                operation: StateOperation::Put,
+                                key: key.clone(),
+                                revision: entry.revision,
+                                entry: Some(entry.clone()),
+                            });
+                        }
+                    }
+                    for (key, entry) in old {
+                        if !next.contains_key(&key) {
+                            queued.push_back(StateChange {
+                                operation: StateOperation::Delete,
+                                key,
+                                revision: entry.revision,
+                                entry: None,
+                            });
+                        }
+                    }
+                }
+                previous = Some(next);
             }
-            let revision = self.revision_by_key.get(&key).copied().unwrap_or(0) + 1;
-            self.apply_change(StateChange {
-                operation: StateOperation::Delete,
-                key,
-                revision,
-                entry: None,
-            });
-        }
-        for entry in snapshot.into_values() {
-            self.apply_change(StateChange {
-                operation: StateOperation::Put,
-                key: entry.key.clone(),
-                revision: entry.revision,
-                entry: Some(entry),
-            });
-        }
-    }
-
-    fn notify(&mut self, change: StateChange) {
-        self.subscribers
-            .retain(|subscriber| subscriber.unbounded_send(Ok(change.clone())).is_ok());
-    }
-
-    fn notify_error(&mut self, error: Error) {
-        let message = error.to_string();
-        self.subscribers.retain(|subscriber| {
-            subscriber
-                .unbounded_send(Err(Error::StateUnavailable(message.clone())))
-                .is_ok()
-        });
-    }
+        },
+    ))
 }
 
 fn check_materialized_status(status: MaterializedStateStatus) -> Result<()> {
@@ -662,6 +895,20 @@ fn check_materialized_status(status: MaterializedStateStatus) -> Result<()> {
 }
 
 impl<S: StateStore> StateStore for MaterializedStateStore<S> {
+    fn authority_epoch(&self) -> Option<u64> {
+        MaterializedStateStore::authority_epoch(self)
+    }
+
+    async fn open_source(&self, prefix: &str) -> Result<StateSource> {
+        self.state.open_source(prefix).await
+    }
+
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
+        let epoch = self.authority_epoch();
+        let revision = self.state.delete_revision(key, revision).await?;
+        self.wait_observed_in_epoch(key, revision, epoch).await?;
+        Ok(revision)
+    }
     async fn ttl_seconds(&self) -> Result<Option<u64>> {
         self.state.ttl_seconds().await
     }
@@ -775,6 +1022,27 @@ impl MemoryStateStore {
 }
 
 impl StateStore for MemoryStateStore {
+    async fn open_source(&self, prefix: &str) -> Result<StateSource> {
+        let (sender, receiver) = unbounded();
+        let mut inner = self.inner.lock().expect("memory state mutex poisoned");
+        let entries = inner
+            .entries
+            .values()
+            .filter(|entry| entry.key.starts_with(prefix))
+            .cloned()
+            .collect();
+        let revision = inner.revision;
+        inner.watchers.push(MemoryStateWatcher {
+            prefix: prefix.to_string(),
+            sender,
+        });
+        Ok(StateSource {
+            entries,
+            revision,
+            replayed: Vec::new(),
+            changes: Box::pin(receiver),
+        })
+    }
     async fn ttl_seconds(&self) -> Result<Option<u64>> {
         Ok(self
             .inner
@@ -889,6 +1157,10 @@ impl StateStore for MemoryStateStore {
     }
 
     async fn delete(&self, key: &str, revision: Option<u64>) -> Result<()> {
+        self.delete_revision(key, revision).await.map(|_| ())
+    }
+
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
         let mut inner = self.inner.lock().expect("memory state mutex poisoned");
         if let Some(expected) = revision {
             let Some(current) = inner.entries.get(key) else {
@@ -902,9 +1174,9 @@ impl StateStore for MemoryStateStore {
                 )));
             }
         }
-        let removed = inner.entries.remove(key);
+        inner.entries.remove(key);
         let revision = Self::next_revision(&mut inner);
-        if removed.is_some() {
+        {
             Self::notify_watchers(
                 &mut inner,
                 StateChange {
@@ -915,7 +1187,7 @@ impl StateStore for MemoryStateStore {
                 },
             );
         }
-        Ok(())
+        Ok(revision)
     }
 
     async fn watch(&self, prefix: &str) -> Result<StateWatchStream> {

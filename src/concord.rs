@@ -1,4 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -90,7 +94,9 @@ pub struct ContractRecord {
     pub schema_id: String,
     pub contract_id: String,
     pub generation: u64,
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::endpoints")]
     pub participants: Vec<EndpointAddress>,
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::endpoints")]
     pub attached_participants: Vec<EndpointAddress>,
     #[serde(default = "default_contract_state")]
     pub state: ContractState,
@@ -101,12 +107,14 @@ pub struct ContractRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terms: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::optional")]
     pub created_by: Option<EndpointAddress>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub participant_sessions: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::optional")]
     pub cancelled_by: Option<EndpointAddress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_at: Option<String>,
@@ -159,7 +167,7 @@ impl ContractRecord {
             ));
         }
         for (participant, session_id) in &self.participant_sessions {
-            let parsed = EndpointAddress::parse(participant)?;
+            let parsed = EndpointAddress::parse_protocol(participant)?;
             if parsed.as_str() != participant || !participants.contains(&parsed) {
                 return Err(Error::Invalid(
                     "participantSessions keys must be named participants".to_string(),
@@ -212,6 +220,7 @@ pub struct ParticipantTokenRecord {
     pub schema_id: String,
     pub contract_id: String,
     pub generation: u64,
+    #[serde(deserialize_with = "crate::endpoint::protocol_serde::endpoint")]
     pub participant: EndpointAddress,
     pub session_id: String,
     pub token_id: String,
@@ -362,6 +371,24 @@ pub struct ConcordManagedContract {
     pub token: Option<ParticipantHandle>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcordViewContract {
+    pub contract: ContractHandle,
+    pub validity: ContractValidity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConcordSnapshot {
+    pub version: u64,
+    pub current: bool,
+    pub closed: bool,
+    pub contracts: Vec<ConcordViewContract>,
+    pub changed: Vec<ContractPointer>,
+    pub resnapshot_required: bool,
+}
+pub type ConcordStateWatch =
+    std::pin::Pin<Box<dyn futures_core::Stream<Item = ConcordSnapshot> + Send>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcordNotificationSource {
     Contract,
@@ -445,7 +472,8 @@ pub struct ConcordParticipantLease {
     requested_refresh_interval: Duration,
     refresh_interval: Duration,
     last_token_refresh_at: Option<Instant>,
-    closed: bool,
+    closed: Arc<AtomicBool>,
+    authority_epochs: Option<(u64, u64)>,
 }
 
 impl ConcordParticipantLease {
@@ -463,7 +491,8 @@ impl ConcordParticipantLease {
             requested_refresh_interval: Duration::from_secs(DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS),
             refresh_interval: Duration::from_secs(DEFAULT_CONCORD_TOKEN_REFRESH_SECONDS),
             last_token_refresh_at: None,
-            closed: false,
+            closed: Arc::new(AtomicBool::new(false)),
+            authority_epochs: None,
         })
     }
 
@@ -482,11 +511,22 @@ impl ConcordParticipantLease {
     }
 
     pub fn token(&self) -> Option<&ParticipantHandle> {
-        self.token.as_ref()
+        self.token.as_ref().filter(|token| {
+            !self.closed.load(Ordering::SeqCst)
+                && self
+                    .last_token_refresh_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(token.ttl_seconds))
+        })
+    }
+
+    fn is_live<C: StateStore, T: StateStore>(&self, concord: &ConcordCoordinator<C, T>) -> bool {
+        self.token().is_some()
+            && self.authority_epochs.is_some()
+            && self.authority_epochs == concord.authority_epochs()
     }
 
     pub fn close(&mut self) {
-        self.closed = true;
+        self.closed.store(true, Ordering::SeqCst);
         self.token = None;
         self.last_token_refresh_at = None;
     }
@@ -496,7 +536,7 @@ impl ConcordParticipantLease {
         concord: &ConcordCoordinator<C, T>,
     ) -> Result<bool> {
         let token = self.token.take();
-        self.closed = true;
+        self.closed.store(true, Ordering::SeqCst);
         self.last_token_refresh_at = None;
         let Some(token) = token else {
             return Ok(false);
@@ -549,11 +589,76 @@ impl ConcordParticipantLease {
         &mut self,
         concord: &ConcordCoordinator<C, T>,
     ) -> Result<ParticipantHandle> {
-        if self.closed {
+        let cleanup_token = self.token.clone();
+        if self.token.is_some() && !self.is_live(concord) {
+            self.close();
+        }
+        let deadline = self
+            .token
+            .as_ref()
+            .and_then(|token| {
+                self.last_token_refresh_at
+                    .map(|at| at + Duration::from_secs(token.ttl_seconds))
+            })
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(5))
+            .min(Instant::now() + Duration::from_secs(5));
+        let mut result =
+            tokio::time::timeout_at(deadline.into(), self.attach_or_refresh_inner(concord))
+                .await
+                .map_err(|_| Error::StateUnavailable("Concord renewal deadline exceeded".into()))
+                .and_then(|result| result);
+        if result.is_ok() && !self.is_live(concord) {
+            result = Err(Error::MaterializedViewStale(
+                "Concord source continuity lost during attachment or renewal".into(),
+            ));
+        }
+        if result.is_err() {
+            self.close();
+            if let Some(token) = cleanup_token {
+                let concord = concord.clone();
+                let contract = self.contract.clone();
+                let participant = self.participant.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        futures_util::future::join(
+                            concord.cancel(
+                                &contract,
+                                &participant,
+                                Some("local renewal failed".into()),
+                            ),
+                            concord.withdraw(&token),
+                        ),
+                    )
+                    .await;
+                });
+            }
+        }
+        result
+    }
+
+    async fn attach_or_refresh_inner<C: StateStore, T: StateStore>(
+        &mut self,
+        concord: &ConcordCoordinator<C, T>,
+    ) -> Result<ParticipantHandle> {
+        if self.closed.load(Ordering::SeqCst) {
             return Err(Error::StateConflict(
                 "Concord participant lease is closed".to_string(),
             ));
         }
+        let epochs = concord.authority_epochs().ok_or_else(|| {
+            Error::MaterializedViewStale("Concord authority source is stale".into())
+        })?;
+        if self
+            .authority_epochs
+            .is_some_and(|previous| previous != epochs)
+        {
+            self.close();
+            return Err(Error::StateConflict(
+                "Concord local authority has ended".into(),
+            ));
+        }
+        self.authority_epochs = Some(epochs);
         if let Some(token) = self.token.clone() {
             match concord.validate_participant_handle(&token).await {
                 Ok(current) => self.adopt(current)?,
@@ -561,7 +666,7 @@ impl ConcordParticipantLease {
                     self.token = None;
                     self.last_token_refresh_at = None;
                     if is_terminal_participant_conflict(&error) {
-                        self.closed = true;
+                        self.closed.store(true, Ordering::SeqCst);
                     }
                     return Err(error);
                 }
@@ -586,7 +691,7 @@ impl ConcordParticipantLease {
                     self.token = None;
                     self.last_token_refresh_at = None;
                     if is_terminal_participant_conflict(&error) {
-                        self.closed = true;
+                        self.closed.store(true, Ordering::SeqCst);
                     }
                     return Err(error);
                 }
@@ -606,7 +711,7 @@ impl ConcordParticipantLease {
             }
             Err(error) => {
                 if is_terminal_participant_conflict(&error) {
-                    self.closed = true;
+                    self.closed.store(true, Ordering::SeqCst);
                 }
                 Err(error)
             }
@@ -626,6 +731,12 @@ pub struct ConcordCoordinator<C: StateStore, T: StateStore> {
 }
 
 impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
+    fn authority_epochs(&self) -> Option<(u64, u64)> {
+        Some((
+            self.contract_state.authority_epoch()?,
+            self.token_state.authority_epoch()?,
+        ))
+    }
     pub fn new(contract_state: C, token_state: T) -> Self {
         Self {
             contract_state,
@@ -1064,117 +1175,199 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
         contract: &ContractHandle,
         current_sessions: Option<&BTreeMap<String, String>>,
     ) -> ContractValidity {
-        let contract_entry = match self.contract_state.get(&contract.key).await {
+        let entry = match self.contract_state.get(&contract.key).await {
             Ok(entry) => entry,
             Err(_) => return validity(ContractValidityStatus::Unavailable, None, None),
         };
-        let Some(contract_entry) = contract_entry else {
-            return validity(ContractValidityStatus::MissingContract, None, None);
-        };
-        let record = match ContractRecord::from_value(contract_entry.value) {
-            Ok(record) => record,
-            Err(error) => {
-                return ContractValidity {
-                    status: ContractValidityStatus::InvalidContract,
-                    contract: None,
-                    tokens: BTreeMap::new(),
-                    reason: Some(error.to_string()),
-                }
-            }
-        };
-        if record.state == ContractState::Cancelled {
-            return validity(
-                ContractValidityStatus::Cancelled,
-                Some(record),
-                None::<String>,
-            );
-        }
-        let attached = record
-            .attached_participants
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-        let mut pending_participant = None::<String>;
         let mut tokens = BTreeMap::new();
-        for participant in &record.participants {
-            let participant_key = participant.to_string();
-            let token_key = make_concord_participant_token_key(
-                &record.contract_id,
-                record.generation,
-                participant,
-            );
-            let token_entry = match self.token_state.get(&token_key).await {
-                Ok(entry) => entry,
-                Err(_) => {
-                    return ContractValidity {
-                        status: ContractValidityStatus::Unavailable,
-                        contract: Some(record),
-                        tokens,
-                        reason: None,
+        if let Some(record) = entry
+            .as_ref()
+            .and_then(|entry| ContractRecord::from_value(entry.value.clone()).ok())
+        {
+            for participant in &record.participants {
+                let key = make_concord_participant_token_key(
+                    &record.contract_id,
+                    record.generation,
+                    participant,
+                );
+                match self.token_state.get(&key).await {
+                    Ok(Some(entry)) => {
+                        tokens.insert(key, entry);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return validity(ContractValidityStatus::Unavailable, Some(record), None)
                     }
                 }
-            };
-            let Some(token_entry) = token_entry else {
-                if attached.contains(&participant_key) {
-                    return ContractValidity {
-                        status: ContractValidityStatus::MissingToken,
-                        contract: Some(record),
-                        tokens,
-                        reason: Some(participant_key),
-                    };
-                }
-                pending_participant.get_or_insert(participant_key);
-                continue;
-            };
-            let token = match ParticipantTokenRecord::from_value(token_entry.value) {
-                Ok(token) => token,
-                Err(error) => {
-                    return ContractValidity {
-                        status: ContractValidityStatus::InvalidToken,
-                        contract: Some(record),
-                        tokens,
-                        reason: Some(error.to_string()),
-                    }
-                }
-            };
-            if let Some(status) =
-                token_validity_status(&token, &record, participant, current_sessions)
-            {
-                tokens.insert(participant_key, token);
-                return ContractValidity {
-                    status,
-                    contract: Some(record),
-                    tokens,
-                    reason: None,
-                };
-            }
-            tokens.insert(participant_key.clone(), token);
-            if !attached.contains(&participant_key) {
-                pending_participant.get_or_insert(participant_key);
             }
         }
-        if let Some(participant) = pending_participant {
-            return ContractValidity {
-                status: ContractValidityStatus::NotYetFulfilled,
-                contract: Some(record),
-                tokens,
-                reason: Some(participant),
-            };
-        }
-        ContractValidity {
-            status: ContractValidityStatus::Valid,
-            contract: Some(record),
-            tokens,
-            reason: None,
-        }
+        evaluate_observations(contract, entry, &tokens, current_sessions)
     }
 }
 
 impl<C: StateStore, T: StateStore>
     ConcordCoordinator<MaterializedStateStore<C>, MaterializedStateStore<T>>
 {
+    pub fn close_sources(&self) {
+        self.contract_state.close();
+        self.token_state.close();
+    }
+    pub async fn close_sources_and_wait(&self) {
+        self.close_sources();
+        self.contract_state.close_and_wait().await;
+        self.token_state.close_and_wait().await;
+    }
     pub fn is_current(&self) -> bool {
         self.contract_state.is_current() && self.token_state.is_current()
+    }
+
+    /// Bounded current-state view; snapshots contain complete filtered membership.
+    pub fn watch_state(&self, filters: ContractFilters<'_>) -> Result<ConcordStateWatch> {
+        let contracts = self
+            .contract_state
+            .watch_snapshots(concord_contracts_prefix())?;
+        let tokens = self
+            .token_state
+            .watch_snapshots(concord_contracts_prefix())?;
+        let profile = filters.profile.map(str::to_owned);
+        let participant = filters.participant.cloned();
+        let contract_id = filters.contract_id.map(str::to_owned);
+        let state = filters.state;
+        Ok(Box::pin(futures_util::stream::unfold(
+            (
+                contracts,
+                tokens,
+                None::<crate::state::StateSnapshot>,
+                None::<crate::state::StateSnapshot>,
+                0u64,
+                BTreeMap::<String, ConcordViewContract>::new(),
+            ),
+            move |(
+                mut contracts,
+                mut tokens,
+                mut contract_snapshot,
+                mut token_snapshot,
+                version,
+                previous,
+            )| {
+                let profile = profile.clone();
+                let participant = participant.clone();
+                let contract_id = contract_id.clone();
+                async move {
+                    if contract_snapshot.is_none() {
+                        contract_snapshot = contracts.next().await;
+                        token_snapshot = tokens.next().await;
+                    } else {
+                        if contract_snapshot.as_ref()?.closed || token_snapshot.as_ref()?.closed {
+                            return None;
+                        }
+                        let next_contract = contracts.next();
+                        let next_token = tokens.next();
+                        pin_mut!(next_contract);
+                        pin_mut!(next_token);
+                        match select(next_contract, next_token).await {
+                            Either::Left((next, _)) => contract_snapshot = next,
+                            Either::Right((next, _)) => token_snapshot = next,
+                        }
+                    }
+                    let cs = contract_snapshot.as_ref()?;
+                    let ts = token_snapshot.as_ref()?;
+                    let current = cs.current && ts.current;
+                    let token_entries = ts
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.key.clone(), entry.clone()))
+                        .collect();
+                    let mut members = BTreeMap::new();
+                    for entry in &cs.entries {
+                        let Some(handle) = contract_handle_from_entry(entry.clone()) else {
+                            continue;
+                        };
+                        if profile
+                            .as_ref()
+                            .is_some_and(|profile| handle.profile.as_ref() != Some(profile))
+                            || participant.as_ref().is_some_and(|participant| {
+                                !handle.participants.contains(participant)
+                            })
+                            || contract_id
+                                .as_ref()
+                                .is_some_and(|id| &handle.contract_id != id)
+                        {
+                            continue;
+                        }
+                        let validity = if current {
+                            evaluate_observations(
+                                &handle,
+                                Some(entry.clone()),
+                                &token_entries,
+                                None,
+                            )
+                        } else {
+                            validity(ContractValidityStatus::Unavailable, None, None)
+                        };
+                        if state.is_some_and(|state| {
+                            validity
+                                .contract
+                                .as_ref()
+                                .is_none_or(|record| record.state != state)
+                        }) {
+                            continue;
+                        }
+                        members.insert(
+                            handle.key.clone(),
+                            ConcordViewContract {
+                                contract: handle,
+                                validity,
+                            },
+                        );
+                    }
+                    let changed_keys: BTreeSet<_> = if version == 0 {
+                        BTreeSet::new()
+                    } else {
+                        previous
+                            .keys()
+                            .chain(members.keys())
+                            .filter(|key| previous.get(*key) != members.get(*key))
+                            .cloned()
+                            .collect()
+                    };
+                    let overflow = changed_keys.len() > 256
+                        || cs.resnapshot_required
+                        || ts.resnapshot_required;
+                    let changed = if overflow {
+                        Vec::new()
+                    } else {
+                        changed_keys
+                            .iter()
+                            .filter_map(|key| members.get(key).or_else(|| previous.get(key)))
+                            .map(|member| ContractPointer {
+                                contract_id: member.contract.contract_id.clone(),
+                                generation: member.contract.generation,
+                            })
+                            .collect()
+                    };
+                    let snapshot = ConcordSnapshot {
+                        version: version + 1,
+                        current,
+                        closed: cs.closed || ts.closed,
+                        contracts: members.values().cloned().collect(),
+                        changed,
+                        resnapshot_required: overflow,
+                    };
+                    Some((
+                        snapshot,
+                        (
+                            contracts,
+                            tokens,
+                            contract_snapshot,
+                            token_snapshot,
+                            version + 1,
+                            members,
+                        ),
+                    ))
+                }
+            },
+        )))
     }
 
     pub async fn wait_current(&self) -> Result<()> {
@@ -1264,109 +1457,24 @@ impl<C: StateStore, T: StateStore>
         contract: &ContractHandle,
         current_sessions: Option<&BTreeMap<String, String>>,
     ) -> ContractValidity {
-        let contract_entry = match self.contract_state.get_cached(&contract.key) {
-            Ok(entry) => entry,
-            Err(_) => return validity(ContractValidityStatus::Unavailable, None, None),
-        };
-        let Some(contract_entry) = contract_entry else {
-            return validity(ContractValidityStatus::MissingContract, None, None);
-        };
-        let record = match ContractRecord::from_value(contract_entry.value) {
-            Ok(record) => record,
-            Err(error) => {
-                return ContractValidity {
-                    status: ContractValidityStatus::InvalidContract,
-                    contract: None,
-                    tokens: BTreeMap::new(),
-                    reason: Some(error.to_string()),
-                }
-            }
-        };
-        if record.state == ContractState::Cancelled {
-            return validity(
-                ContractValidityStatus::Cancelled,
-                Some(record),
-                None::<String>,
-            );
+        let contracts = self.contract_state.snapshot();
+        let tokens = self.token_state.snapshot();
+        if !contracts.current || !tokens.current {
+            return validity(ContractValidityStatus::Unavailable, None, None);
         }
-        let attached = record
-            .attached_participants
-            .iter()
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
-        let mut pending_participant = None::<String>;
-        let mut tokens = BTreeMap::new();
-        for participant in &record.participants {
-            let participant_key = participant.to_string();
-            let token_key = make_concord_participant_token_key(
-                &record.contract_id,
-                record.generation,
-                participant,
-            );
-            let token_entry = match self.token_state.get_cached(&token_key) {
-                Ok(entry) => entry,
-                Err(_) => {
-                    return ContractValidity {
-                        status: ContractValidityStatus::Unavailable,
-                        contract: Some(record),
-                        tokens,
-                        reason: None,
-                    }
-                }
-            };
-            let Some(token_entry) = token_entry else {
-                if attached.contains(&participant_key) {
-                    return ContractValidity {
-                        status: ContractValidityStatus::MissingToken,
-                        contract: Some(record),
-                        tokens,
-                        reason: Some(participant_key),
-                    };
-                }
-                pending_participant.get_or_insert(participant_key);
-                continue;
-            };
-            let token = match ParticipantTokenRecord::from_value(token_entry.value) {
-                Ok(token) => token,
-                Err(error) => {
-                    return ContractValidity {
-                        status: ContractValidityStatus::InvalidToken,
-                        contract: Some(record),
-                        tokens,
-                        reason: Some(error.to_string()),
-                    }
-                }
-            };
-            if let Some(status) =
-                token_validity_status(&token, &record, participant, current_sessions)
-            {
-                tokens.insert(participant_key, token);
-                return ContractValidity {
-                    status,
-                    contract: Some(record),
-                    tokens,
-                    reason: None,
-                };
-            }
-            tokens.insert(participant_key.clone(), token);
-            if !attached.contains(&participant_key) {
-                pending_participant.get_or_insert(participant_key);
-            }
-        }
-        if let Some(participant) = pending_participant {
-            return ContractValidity {
-                status: ContractValidityStatus::NotYetFulfilled,
-                contract: Some(record),
-                tokens,
-                reason: Some(participant),
-            };
-        }
-        ContractValidity {
-            status: ContractValidityStatus::Valid,
-            contract: Some(record),
-            tokens,
-            reason: None,
-        }
+        evaluate_observations(
+            contract,
+            contracts
+                .entries
+                .into_iter()
+                .find(|entry| entry.key == contract.key),
+            &tokens
+                .entries
+                .into_iter()
+                .map(|entry| (entry.key.clone(), entry))
+                .collect(),
+            current_sessions,
+        )
     }
 
     pub async fn watch_contract_notifications_cached(
@@ -1409,6 +1517,7 @@ pub struct ConcordParticipantManager<C: StateStore, T: StateStore> {
     managed: BTreeMap<String, ConcordManagedContract>,
     leases: BTreeMap<String, ConcordParticipantLease>,
     contract_index: BTreeMap<String, ContractHandle>,
+    terminated: BTreeSet<String>,
 }
 
 impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
@@ -1427,6 +1536,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
             managed: BTreeMap::new(),
             leases: BTreeMap::new(),
             contract_index: BTreeMap::new(),
+            terminated: BTreeSet::new(),
         })
     }
 
@@ -1445,10 +1555,79 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
     }
 
     pub fn managed_contracts(&self) -> Vec<ConcordManagedContract> {
-        self.managed.values().cloned().collect()
+        self.managed
+            .values()
+            .filter(|managed| {
+                self.leases
+                    .get(&managed.contract.key)
+                    .is_some_and(|lease| lease.is_live(&self.concord))
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn owned_contract_keys(&self) -> Vec<String> {
+        self.leases.keys().cloned().collect()
+    }
+
+    pub(crate) fn revoke_lost_authority(&mut self) {
+        self.prune_lost_authority();
+    }
+
+    pub fn has_authority(&self, contract_key: &str) -> bool {
+        self.managed
+            .get(contract_key)
+            .is_some_and(|managed| managed.validity.valid())
+            && self
+                .leases
+                .get(contract_key)
+                .is_some_and(|lease| lease.is_live(&self.concord))
+    }
+
+    fn terminate(&mut self, key: &str) {
+        self.managed.remove(key);
+        self.contract_index.remove(key);
+        if let Some(mut lease) = self.leases.remove(key) {
+            // An unaccepted candidate has no local authority to terminate.
+            // It may become eligible when the caller's selection policy changes.
+            self.terminated.insert(key.to_string());
+            let token = lease.token.clone();
+            lease.close();
+            let concord = self.concord.clone();
+            let participant = self.participant.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    let cancel = concord.cancel(
+                        &lease.contract,
+                        &participant,
+                        Some("local authority ended".into()),
+                    );
+                    let withdraw = async {
+                        if let Some(token) = token {
+                            let _ = concord.withdraw(&token).await;
+                        }
+                    };
+                    let _ = futures_util::future::join(cancel, withdraw).await;
+                })
+                .await;
+            });
+        }
+    }
+
+    fn prune_lost_authority(&mut self) {
+        let lost: Vec<_> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| !lease.is_live(&self.concord))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in lost {
+            self.terminate(&key);
+        }
     }
 
     pub fn release(&mut self, contract_key: &str) {
+        self.terminated.insert(contract_key.to_string());
         if let Some(mut lease) = self.leases.remove(contract_key) {
             lease.close();
         }
@@ -1457,6 +1636,9 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
     }
 
     pub async fn release_withdraw(&mut self, contract_key: &str) -> Result<bool> {
+        self.terminated.insert(contract_key.to_string());
+        self.managed.remove(contract_key);
+        self.contract_index.remove(contract_key);
         let mut lease = self.leases.remove(contract_key);
         let withdrawn = if let Some(lease) = lease.as_mut() {
             lease.withdraw(&self.concord).await?
@@ -1482,6 +1664,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
     where
         F: FnMut(&ContractHandle, &ContractRecord) -> Result<bool>,
     {
+        self.prune_lost_authority();
         let mut contracts = self
             .concord
             .contracts(ContractFilters {
@@ -1501,14 +1684,33 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
         let mut current_leases = self.leases.clone();
 
         for contract in contracts {
+            if self.terminated.contains(&contract.key) {
+                continue;
+            }
             let key = contract.key.clone();
             let lease = current_leases.remove(&key);
-            let Some((managed, lease)) = self
-                .reconcile_contract(contract, lease, &mut accept_contract, current_sessions)
-                .await?
-            else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.reconcile_contract(contract, lease, &mut accept_contract, current_sessions),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::StateUnavailable(
+                    "Concord reconciliation deadline exceeded".into(),
+                ))
+            });
+            let Some((managed, lease)) = (match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.terminate(&key);
+                    return Err(error);
+                }
+            }) else {
+                self.terminate(&key);
                 continue;
             };
+            self.leases.insert(key.clone(), lease.clone());
+            self.managed.insert(key.clone(), managed.clone());
             next_leases.insert(key.clone(), lease);
             next_managed.insert(key, managed);
         }
@@ -1530,6 +1732,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
     where
         F: FnMut(&ContractHandle, &ContractRecord) -> Result<bool>,
     {
+        self.prune_lost_authority();
         let contract_key =
             make_concord_contract_key(&notification.contract_id, notification.generation);
         let contract = match notification.source {
@@ -1550,17 +1753,33 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
         };
 
         let key = contract.key.clone();
-        let lease = self.leases.remove(&key);
-        match self
-            .reconcile_contract(contract, lease, &mut accept_contract, current_sessions)
-            .await?
-        {
+        let lease = self.leases.get(&key).cloned();
+        if self.terminated.contains(&key) {
+            return Ok(self.managed_contracts());
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.reconcile_contract(contract, lease, &mut accept_contract, current_sessions),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::StateUnavailable(
+                "Concord reconciliation deadline exceeded".into(),
+            ))
+        });
+        match match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.terminate(&key);
+                return Err(error);
+            }
+        } {
             Some((managed, lease)) => {
                 self.leases.insert(key.clone(), lease);
                 self.managed.insert(key, managed);
             }
             None => {
-                self.managed.remove(&key);
+                self.terminate(&key);
             }
         }
         Ok(self.managed_contracts())
@@ -1570,6 +1789,7 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
         &mut self,
         current_sessions: Option<&BTreeMap<String, String>>,
     ) -> Result<Vec<ConcordManagedContract>> {
+        self.prune_lost_authority();
         let contracts = self
             .managed
             .values()
@@ -1582,14 +1802,33 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
             |_: &ContractHandle, _: &ContractRecord| -> Result<bool> { Ok(true) };
 
         for contract in contracts {
+            if self.terminated.contains(&contract.key) {
+                continue;
+            }
             let key = contract.key.clone();
             let lease = current_leases.remove(&key);
-            let Some((managed, lease)) = self
-                .reconcile_contract(contract, lease, &mut accept_contract, current_sessions)
-                .await?
-            else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.reconcile_contract(contract, lease, &mut accept_contract, current_sessions),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::StateUnavailable(
+                    "Concord reconciliation deadline exceeded".into(),
+                ))
+            });
+            let Some((managed, lease)) = (match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.terminate(&key);
+                    return Err(error);
+                }
+            }) else {
+                self.terminate(&key);
                 continue;
             };
+            self.leases.insert(key.clone(), lease.clone());
+            self.managed.insert(key.clone(), managed.clone());
             next_leases.insert(key.clone(), lease);
             next_managed.insert(key, managed);
         }
@@ -1840,6 +2079,32 @@ impl<C: StateStore, T: StateStore> ConcordParticipantManager<C, T> {
 impl<C: StateStore, T: StateStore>
     ConcordParticipantManager<MaterializedStateStore<C>, MaterializedStateStore<T>>
 {
+    /// Check current records as well as the permanently fenced local lease.
+    pub fn has_current_authority(&mut self, key: &str) -> bool {
+        self.prune_lost_authority();
+        if !self.has_authority(key) {
+            return false;
+        }
+        let managed = &self.managed[key];
+        let validity = self
+            .concord
+            .validate_cached(&managed.contract, Some(&self.current_sessions(None)));
+        let token_matches = self
+            .concord
+            .participant_token_cached(&managed.contract, &self.participant)
+            .ok()
+            .flatten()
+            .is_some_and(|token| {
+                self.leases[key]
+                    .token()
+                    .is_some_and(|held| participant_handle_matches(held, &token))
+            });
+        if !validity.valid() || !token_matches {
+            self.terminate(key);
+            return false;
+        }
+        true
+    }
     pub async fn wait_current(&self) -> Result<()> {
         self.concord.wait_current().await
     }
@@ -1852,7 +2117,12 @@ impl<C: StateStore, T: StateStore>
     where
         F: FnMut(&ContractHandle, &ContractRecord) -> Result<bool>,
     {
-        self.concord.wait_current().await?;
+        self.prune_lost_authority();
+        if self.concord.authority_epochs().is_none() {
+            return Err(Error::MaterializedViewStale(
+                "Concord source is stale".into(),
+            ));
+        }
         let mut contracts = self.concord.contracts_cached(ContractFilters {
             profile: self.profile.as_deref(),
             participant: Some(&self.participant),
@@ -1869,14 +2139,38 @@ impl<C: StateStore, T: StateStore>
         let mut current_leases = self.leases.clone();
 
         for contract in contracts {
+            if self.terminated.contains(&contract.key) {
+                continue;
+            }
             let key = contract.key.clone();
             let lease = current_leases.remove(&key);
-            let Some((managed, lease)) = self
-                .reconcile_contract_cached(contract, lease, &mut accept_contract, current_sessions)
-                .await?
-            else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.reconcile_contract_cached(
+                    contract,
+                    lease,
+                    &mut accept_contract,
+                    current_sessions,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::StateUnavailable(
+                    "Concord reconciliation deadline exceeded".into(),
+                ))
+            });
+            let Some((managed, lease)) = (match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.terminate(&key);
+                    return Err(error);
+                }
+            }) else {
+                self.terminate(&key);
                 continue;
             };
+            self.leases.insert(key.clone(), lease.clone());
+            self.managed.insert(key.clone(), managed.clone());
             next_leases.insert(key.clone(), lease);
             next_managed.insert(key, managed);
         }
@@ -1898,7 +2192,12 @@ impl<C: StateStore, T: StateStore>
     where
         F: FnMut(&ContractHandle, &ContractRecord) -> Result<bool>,
     {
-        self.concord.wait_current().await?;
+        self.prune_lost_authority();
+        if self.concord.authority_epochs().is_none() {
+            return Err(Error::MaterializedViewStale(
+                "Concord source is stale".into(),
+            ));
+        }
         let contract_key =
             make_concord_contract_key(&notification.contract_id, notification.generation);
         let contract = match notification.source {
@@ -1919,17 +2218,33 @@ impl<C: StateStore, T: StateStore>
         };
 
         let key = contract.key.clone();
-        let lease = self.leases.remove(&key);
-        match self
-            .reconcile_contract_cached(contract, lease, &mut accept_contract, current_sessions)
-            .await?
-        {
+        let lease = self.leases.get(&key).cloned();
+        if self.terminated.contains(&key) {
+            return Ok(self.managed_contracts());
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.reconcile_contract_cached(contract, lease, &mut accept_contract, current_sessions),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::StateUnavailable(
+                "Concord reconciliation deadline exceeded".into(),
+            ))
+        });
+        match match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.terminate(&key);
+                return Err(error);
+            }
+        } {
             Some((managed, lease)) => {
                 self.leases.insert(key.clone(), lease);
                 self.managed.insert(key, managed);
             }
             None => {
-                self.managed.remove(&key);
+                self.terminate(&key);
             }
         }
         Ok(self.managed_contracts())
@@ -1939,7 +2254,12 @@ impl<C: StateStore, T: StateStore>
         &mut self,
         current_sessions: Option<&BTreeMap<String, String>>,
     ) -> Result<Vec<ConcordManagedContract>> {
-        self.concord.wait_current().await?;
+        self.prune_lost_authority();
+        if self.concord.authority_epochs().is_none() {
+            return Err(Error::MaterializedViewStale(
+                "Concord source is stale".into(),
+            ));
+        }
         let contracts = self
             .managed
             .values()
@@ -1952,14 +2272,38 @@ impl<C: StateStore, T: StateStore>
             |_: &ContractHandle, _: &ContractRecord| -> Result<bool> { Ok(true) };
 
         for contract in contracts {
+            if self.terminated.contains(&contract.key) {
+                continue;
+            }
             let key = contract.key.clone();
             let lease = current_leases.remove(&key);
-            let Some((managed, lease)) = self
-                .reconcile_contract_cached(contract, lease, &mut accept_contract, current_sessions)
-                .await?
-            else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.reconcile_contract_cached(
+                    contract,
+                    lease,
+                    &mut accept_contract,
+                    current_sessions,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::StateUnavailable(
+                    "Concord reconciliation deadline exceeded".into(),
+                ))
+            });
+            let Some((managed, lease)) = (match result {
+                Ok(value) => value,
+                Err(error) => {
+                    self.terminate(&key);
+                    return Err(error);
+                }
+            }) else {
+                self.terminate(&key);
                 continue;
             };
+            self.leases.insert(key.clone(), lease.clone());
+            self.managed.insert(key.clone(), managed.clone());
             next_leases.insert(key.clone(), lease);
             next_managed.insert(key, managed);
         }
@@ -2467,4 +2811,104 @@ fn default_contract_state() -> ContractState {
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn evaluate_observations(
+    contract: &ContractHandle,
+    contract_entry: Option<StateEntry>,
+    token_entries: &BTreeMap<String, StateEntry>,
+    current_sessions: Option<&BTreeMap<String, String>>,
+) -> ContractValidity {
+    let Some(contract_entry) = contract_entry else {
+        return validity(ContractValidityStatus::MissingContract, None, None);
+    };
+    let record = match ContractRecord::from_value(contract_entry.value) {
+        Ok(record) => record,
+        Err(error) => {
+            return ContractValidity {
+                status: ContractValidityStatus::InvalidContract,
+                contract: None,
+                tokens: BTreeMap::new(),
+                reason: Some(error.to_string()),
+            }
+        }
+    };
+    if record.contract_id != contract.contract_id || record.generation != contract.generation {
+        return validity(
+            ContractValidityStatus::GenerationMismatch,
+            Some(record),
+            None,
+        );
+    }
+    if record.state == ContractState::Cancelled {
+        return validity(
+            ContractValidityStatus::Cancelled,
+            Some(record),
+            None::<String>,
+        );
+    }
+    let attached = record
+        .attached_participants
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut pending_participant = None::<String>;
+    let mut tokens = BTreeMap::new();
+    for participant in &record.participants {
+        let participant_key = participant.to_string();
+        let token_key =
+            make_concord_participant_token_key(&record.contract_id, record.generation, participant);
+        let token_entry = token_entries.get(&token_key).cloned();
+        let Some(token_entry) = token_entry else {
+            if attached.contains(&participant_key) {
+                return ContractValidity {
+                    status: ContractValidityStatus::MissingToken,
+                    contract: Some(record),
+                    tokens,
+                    reason: Some(participant_key),
+                };
+            }
+            pending_participant.get_or_insert(participant_key);
+            continue;
+        };
+        let token = match ParticipantTokenRecord::from_value(token_entry.value) {
+            Ok(token) => token,
+            Err(error) => {
+                return ContractValidity {
+                    status: ContractValidityStatus::InvalidToken,
+                    contract: Some(record),
+                    tokens,
+                    reason: Some(error.to_string()),
+                }
+            }
+        };
+        if let Some(status) = token_validity_status(&token, &record, participant, current_sessions)
+        {
+            tokens.insert(participant_key, token);
+            return ContractValidity {
+                status,
+                contract: Some(record),
+                tokens,
+                reason: None,
+            };
+        }
+        tokens.insert(participant_key.clone(), token);
+        if !attached.contains(&participant_key) {
+            pending_participant.get_or_insert(participant_key);
+        }
+    }
+    if let Some(participant) = pending_participant {
+        return ContractValidity {
+            status: ContractValidityStatus::NotYetFulfilled,
+            contract: Some(record),
+            tokens,
+            reason: Some(participant),
+        };
+    }
+    ContractValidity {
+        status: ContractValidityStatus::Valid,
+        contract: Some(record),
+        tokens,
+        reason: None,
+    }
 }

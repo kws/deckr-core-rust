@@ -925,16 +925,15 @@ async fn start_routes_subscribed_commands_and_stop_withdraws_beacon_and_claims()
         ContractValidityStatus::MissingToken
     );
 
-    h.lane
-        .publish_inbound(control_command("main", "controller-session"));
-    wait_for_published(&h, 1).await;
+    assert!(h
+        .lane
+        .inbound_tx
+        .unbounded_send(Ok(control_command("main", "controller-session")))
+        .is_err());
     assert_eq!(h.command_handler.messages().await.len(), 1);
-    let published = h.lane.published().await;
-    assert!(matches!(
-        published.last().unwrap().hardware_body().unwrap(),
-        HardwareMessageBody::CommandRejected { ref reason, .. } if reason == "unauthorized"
-    ));
-
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .unwrap();
 }

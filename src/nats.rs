@@ -1,14 +1,20 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
-use async_nats::jetstream::consumer::{push::OrderedConfig, DeliverPolicy, ReplayPolicy};
-use async_nats::jetstream::kv::{Config as KvConfig, Entry, Operation, Store, WatcherError};
+use async_nats::jetstream::consumer::{
+    push::Config as PushConfig, AckPolicy, DeliverPolicy, ReplayPolicy,
+};
+use async_nats::jetstream::kv::{Config as KvConfig, Operation, Store};
 use async_nats::jetstream::Context as JetStreamContext;
 use async_nats::{HeaderMap, Message, Subscriber};
 use futures_util::future::{select, Either};
 use futures_util::pin_mut;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -21,8 +27,8 @@ use crate::concord::{
 use crate::endpoint::EndpointAddress;
 use crate::lanes::{headers_for, validate_subject_hint, DeckrMessage, HARDWARE_MESSAGES_LANE};
 use crate::state::{
-    MaterializedStateStore, StateChange, StateEntry, StateOperation, StateStore, StateStorePolicy,
-    StateWatchStream,
+    MaterializedStateStore, StateChange, StateEntry, StateOperation, StateSource, StateStore,
+    StateStorePolicy, StateWatchStream,
 };
 use crate::{Error, Result};
 
@@ -64,7 +70,6 @@ pub enum RuntimeBucket {
     BeaconAdvertisements,
     ConcordContracts,
     ConcordTokens,
-    ConcordMaintenance,
 }
 
 #[derive(Debug, Clone)]
@@ -141,7 +146,6 @@ impl DeckrRuntime {
             RuntimeBucket::BeaconAdvertisements => self.inner.beacon_advertisements(),
             RuntimeBucket::ConcordContracts => self.inner.concord_contracts(),
             RuntimeBucket::ConcordTokens => self.inner.concord_tokens(),
-            RuntimeBucket::ConcordMaintenance => self.inner.concord_maintenance(),
         }
     }
 }
@@ -204,7 +208,8 @@ pub struct NatsDeckrRuntime {
     beacon_advertisements: NatsStateStore,
     concord_contracts: NatsStateStore,
     concord_tokens: NatsStateStore,
-    concord_maintenance: NatsStateStore,
+    concord_maintenance_bucket: String,
+    connection_epoch: Arc<AtomicU64>,
 }
 
 impl NatsDeckrRuntime {
@@ -229,7 +234,21 @@ impl NatsDeckrRuntime {
     }
 
     pub async fn connect_with_config(config: DeckrRuntimeConfig) -> Result<Self> {
-        let client = async_nats::connect(config.nats_url.as_str())
+        let connection_epoch = Arc::new(AtomicU64::new(0));
+        let event_epoch = connection_epoch.clone();
+        let client = async_nats::ConnectOptions::new()
+            .event_callback(move |event| {
+                let epoch = event_epoch.clone();
+                async move {
+                    if matches!(
+                        event,
+                        async_nats::Event::Disconnected | async_nats::Event::Connected
+                    ) {
+                        epoch.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+            .connect(config.nats_url.as_str())
             .await
             .map_err(|error| {
                 Error::StateUnavailable(format!("connecting to NATS {}: {error}", config.nats_url))
@@ -237,26 +256,26 @@ impl NatsDeckrRuntime {
         let jetstream = async_nats::jetstream::new(client.clone());
         let beacon_advertisements = open_state_bucket(
             &jetstream,
+            &client,
+            &connection_epoch,
             &config.beacon_advertisement_bucket,
             beacon_advertisement_store_policy(),
         )
         .await?;
         let concord_contracts = open_state_bucket(
             &jetstream,
+            &client,
+            &connection_epoch,
             &config.concord_contract_bucket,
             concord_contract_store_policy(),
         )
         .await?;
         let concord_tokens = open_state_bucket(
             &jetstream,
+            &client,
+            &connection_epoch,
             &config.concord_token_bucket,
             concord_token_store_policy(),
-        )
-        .await?;
-        let concord_maintenance = open_state_bucket(
-            &jetstream,
-            &config.concord_maintenance_bucket,
-            concord_maintenance_store_policy(),
         )
         .await?;
         Ok(Self {
@@ -264,7 +283,8 @@ impl NatsDeckrRuntime {
             beacon_advertisements,
             concord_contracts,
             concord_tokens,
-            concord_maintenance,
+            concord_maintenance_bucket: config.concord_maintenance_bucket,
+            connection_epoch,
         })
     }
 
@@ -280,8 +300,16 @@ impl NatsDeckrRuntime {
         &self.concord_tokens
     }
 
-    pub fn concord_maintenance(&self) -> &NatsStateStore {
-        &self.concord_maintenance
+    /// Explicit optional maintenance capability; ordinary startup never opens it.
+    pub async fn concord_maintenance(&self) -> Result<NatsStateStore> {
+        open_state_bucket(
+            &async_nats::jetstream::new(self.client.clone()),
+            &self.client,
+            &self.connection_epoch,
+            &self.concord_maintenance_bucket,
+            concord_maintenance_store_policy(),
+        )
+        .await
     }
 
     pub async fn publish(&self, message: &DeckrMessage) -> Result<()> {
@@ -377,9 +405,91 @@ impl EndpointLaneSubscriber {
 pub struct NatsStateStore {
     kv: Store,
     policy: StateStorePolicy,
+    client: async_nats::Client,
+    connection_epoch: Arc<AtomicU64>,
 }
 
 impl NatsStateStore {
+    async fn open_snapshot(&self, prefix: &str) -> Result<NatsSnapshot> {
+        tokio::time::timeout(Duration::from_secs(5), self.open_snapshot_inner(prefix))
+            .await
+            .map_err(|_| Error::StateUnavailable("snapshot deadline exceeded".into()))?
+    }
+
+    async fn open_snapshot_inner(&self, prefix: &str) -> Result<NatsSnapshot> {
+        let epoch = self.connection_epoch.load(Ordering::SeqCst);
+        let status =
+            self.kv.status().await.map_err(|error| {
+                Error::StateUnavailable(format!("snapshot high water: {error}"))
+            })?;
+        let revision = status.info.state.last_sequence;
+        let subject = self.client.new_inbox();
+        let subscriber = self
+            .client
+            .subscribe(subject.clone())
+            .await
+            .map_err(|error| Error::StateUnavailable(format!("snapshot subscription: {error}")))?;
+        let name = format!("deckr_{}", Uuid::new_v4().simple());
+        // Plain push delivery exposes heartbeats and continuity gaps instead of
+        // silently recreating ordered consumers inside the NATS client.
+        let mut watch = NatsSourceWatch {
+            store: self.clone(),
+            subscriber,
+            consumer: Some(name.clone()),
+            epoch,
+            sequence: 0,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(3),
+        };
+        let consumer = self
+            .kv
+            .stream
+            .create_consumer(PushConfig {
+                name: Some(name),
+                deliver_subject: subject,
+                filter_subject: format!("{}{prefix}>", self.kv.prefix),
+                ack_policy: AckPolicy::None,
+                deliver_policy: DeliverPolicy::LastPerSubject,
+                replay_policy: ReplayPolicy::Instant,
+                idle_heartbeat: Duration::from_secs(1),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| Error::StateUnavailable(format!("snapshot consumer: {error}")))?;
+        let mut entries = BTreeMap::new();
+        let mut replayed = Vec::new();
+        if consumer.cached_info().num_pending > 0 {
+            loop {
+                let message = watch.next_message().await?;
+                let info = message.info().map_err(|error| {
+                    Error::StateUnavailable(format!("snapshot metadata: {error}"))
+                })?;
+                let pending = info.pending;
+                let change = watch.change(&message)?;
+                if change.revision > revision {
+                    replayed.push(change);
+                } else if let Some(entry) = change.entry {
+                    entries.insert(change.key, entry);
+                } else {
+                    entries.remove(&change.key);
+                }
+                if pending == 0 {
+                    break;
+                }
+            }
+        }
+        if self.connection_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(Error::MaterializedViewStale(
+                "connection changed during snapshot".into(),
+            ));
+        }
+        replayed.sort_by_key(|change| change.revision);
+        Ok(NatsSnapshot {
+            entries: entries.into_values().collect(),
+            revision,
+            replayed,
+            watch,
+        })
+    }
     pub fn policy(&self) -> &StateStorePolicy {
         &self.policy
     }
@@ -406,6 +516,146 @@ impl NatsStateStore {
     }
 }
 
+struct NatsSnapshot {
+    entries: Vec<StateEntry>,
+    revision: u64,
+    replayed: Vec<StateChange>,
+    watch: NatsSourceWatch,
+}
+
+struct NatsSourceWatch {
+    store: NatsStateStore,
+    subscriber: Subscriber,
+    consumer: Option<String>,
+    epoch: u64,
+    sequence: u64,
+    deadline: tokio::time::Instant,
+}
+impl NatsSourceWatch {
+    async fn next_message(&mut self) -> Result<async_nats::jetstream::Message> {
+        loop {
+            if self.store.connection_epoch.load(Ordering::SeqCst) != self.epoch
+                || self.store.client.connection_state() != async_nats::connection::State::Connected
+            {
+                return Err(Error::MaterializedViewStale(
+                    "NATS connection continuity lost".into(),
+                ));
+            }
+            if tokio::time::Instant::now() >= self.deadline {
+                return Err(Error::MaterializedViewStale(
+                    "NATS watch heartbeat missed".into(),
+                ));
+            }
+            let message =
+                match tokio::time::timeout(Duration::from_millis(25), self.subscriber.next()).await
+                {
+                    Err(_) => continue,
+                    Ok(None) => {
+                        return Err(Error::MaterializedViewStale("NATS watch ended".into()))
+                    }
+                    Ok(Some(message)) => message,
+                };
+            self.deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            if message.status == Some(async_nats::StatusCode::IDLE_HEARTBEAT) {
+                if message
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| headers.get("Nats-Last-Consumer"))
+                    .and_then(|value| value.as_str().parse::<u64>().ok())
+                    .is_some_and(|sequence| sequence != self.sequence)
+                {
+                    return Err(Error::MaterializedViewStale(
+                        "NATS watch sequence gap".into(),
+                    ));
+                }
+                continue;
+            }
+            if message.status.is_some() {
+                return Err(Error::MaterializedViewStale(
+                    "NATS consumer status changed".into(),
+                ));
+            }
+            let message = async_nats::jetstream::Message {
+                message,
+                context: async_nats::jetstream::new(self.store.client.clone()),
+            };
+            let info = message
+                .info()
+                .map_err(|error| Error::StateUnavailable(format!("watch metadata: {error}")))?;
+            if info.consumer_sequence != self.sequence + 1 {
+                return Err(Error::MaterializedViewStale(
+                    "NATS watch sequence gap".into(),
+                ));
+            }
+            self.sequence = info.consumer_sequence;
+            return Ok(message);
+        }
+    }
+    fn change(&self, message: &async_nats::jetstream::Message) -> Result<StateChange> {
+        let revision = message
+            .info()
+            .map_err(|error| Error::StateUnavailable(format!("watch metadata: {error}")))?
+            .stream_sequence;
+        let key = message
+            .subject
+            .strip_prefix(&self.store.kv.prefix)
+            .ok_or_else(|| Error::Invalid("watch subject outside bucket".into()))?
+            .to_string();
+        let operation = if kv_operation_from_message(&message.message) == Operation::Put {
+            StateOperation::Put
+        } else {
+            StateOperation::Delete
+        };
+        let entry = if operation == StateOperation::Put {
+            Some(StateEntry {
+                key: key.clone(),
+                value: serde_json::from_slice(&message.payload)?,
+                revision,
+            })
+        } else {
+            None
+        };
+        Ok(StateChange {
+            operation,
+            key,
+            revision,
+            entry,
+        })
+    }
+    async fn next_change(&mut self) -> Result<StateChange> {
+        let message = self.next_message().await?;
+        self.change(&message)
+    }
+    async fn close(&mut self) -> Result<()> {
+        if let Some(name) = self.consumer.as_ref() {
+            self.store
+                .kv
+                .stream
+                .delete_consumer(name)
+                .await
+                .map_err(|error| {
+                    Error::StateUnavailable(format!("closing watch consumer: {error}"))
+                })?;
+            self.consumer = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for NatsSourceWatch {
+    fn drop(&mut self) {
+        if let Some(name) = self.consumer.take() {
+            let stream = self.store.kv.stream.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(5), stream.delete_consumer(&name))
+                            .await;
+                });
+            }
+        }
+    }
+}
+
 impl StateStore for NatsStateStore {
     async fn ttl_seconds(&self) -> Result<Option<u64>> {
         Ok(self.policy.broker_ttl_seconds)
@@ -429,79 +679,43 @@ impl StateStore for NatsStateStore {
     }
 
     async fn items(&self, prefix: &str) -> Result<Vec<StateEntry>> {
-        let subject = format!("{}{}>", self.kv.prefix, prefix);
-        let mut consumer = self
-            .kv
-            .stream
-            .create_consumer(OrderedConfig {
-                deliver_subject: format!("_INBOX.deckr.{}", Uuid::new_v4().simple()),
-                description: Some("deckr prefix state listing".to_string()),
-                filter_subject: subject,
-                headers_only: true,
-                replay_policy: ReplayPolicy::Instant,
-                deliver_policy: DeliverPolicy::LastPerSubject,
-                ..Default::default()
-            })
-            .await
-            .map_err(|error| {
-                Error::StateUnavailable(format!("listing state prefix {prefix:?}: {error}"))
-            })?;
-        let consumer_info = consumer.info().await.map_err(|error| {
-            Error::StateUnavailable(format!(
-                "reading state prefix {prefix:?} consumer info: {error}"
-            ))
-        })?;
-        if consumer_info.num_pending == 0 {
-            return Ok(Vec::new());
-        }
-        let mut messages = consumer.messages().await.map_err(|error| {
-            Error::StateUnavailable(format!("reading state prefix {prefix:?}: {error}"))
-        })?;
-        let mut entries = Vec::new();
-        while let Some(message) = match messages.try_next().await {
-            Ok(message) => message,
-            Err(error) => {
-                return Err(Error::StateUnavailable(format!(
-                    "reading state prefix {prefix:?}: {error}"
-                )))
-            }
-        } {
-            let info = message.info().map_err(|error| {
-                Error::StateUnavailable(format!(
-                    "reading state prefix {prefix:?} message metadata: {error}"
-                ))
-            })?;
-            let operation = kv_operation_from_message(&message.message);
-            if matches!(operation, Operation::Delete | Operation::Purge) {
-                if info.pending == 0 {
-                    break;
-                }
-                continue;
-            }
-            let Some(key) = message
-                .subject
-                .strip_prefix(&self.kv.prefix)
-                .map(str::to_string)
-            else {
-                if info.pending == 0 {
-                    break;
-                }
-                continue;
-            };
-            if !key.starts_with(prefix) {
-                if info.pending == 0 {
-                    break;
-                }
-                continue;
-            }
-            if let Some(entry) = self.get(&key).await? {
-                entries.push(entry);
-            }
-            if info.pending == 0 {
-                break;
+        let mut snapshot = self.open_snapshot(prefix).await?;
+        snapshot.watch.close().await?;
+        let mut entries: BTreeMap<_, _> = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect();
+        for change in snapshot.replayed {
+            if let Some(entry) = change.entry {
+                entries.insert(change.key, entry);
+            } else {
+                entries.remove(&change.key);
             }
         }
-        Ok(entries)
+        Ok(entries.into_values().collect())
+    }
+
+    async fn open_source(&self, prefix: &str) -> Result<StateSource> {
+        let NatsSnapshot {
+            entries,
+            revision,
+            replayed,
+            watch,
+        } = self.open_snapshot(prefix).await?;
+        let changes = Box::pin(futures_util::stream::unfold(
+            watch,
+            |mut watch| async move {
+                let item = watch.next_change().await;
+                Some((item, watch))
+            },
+        ));
+        Ok(StateSource {
+            entries,
+            revision,
+            replayed,
+            changes,
+        })
     }
 
     async fn put(&self, key: &str, value: Value, ttl: Option<u64>) -> Result<StateEntry> {
@@ -567,52 +781,49 @@ impl StateStore for NatsStateStore {
     }
 
     async fn delete(&self, key: &str, revision: Option<u64>) -> Result<()> {
-        self.kv
-            .delete_expect_revision(key, revision)
+        self.delete_revision(key, revision).await.map(|_| ())
+    }
+
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
+        let mut headers = HeaderMap::new();
+        headers.insert("KV-Operation", "DEL");
+        if let Some(revision) = revision {
+            headers.insert("Nats-Expected-Last-Subject-Sequence", revision.to_string());
+        }
+        let context = async_nats::jetstream::new(self.client.clone());
+        let ack = context
+            .publish_with_headers(format!("{}{}", self.kv.prefix, key), headers, "".into())
+            .await
+            .map_err(|error| Error::StateUnavailable(format!("deleting state: {error}")))?
             .await
             .map_err(|error| {
                 if is_revision_conflict(&error) {
                     Error::StateConflict(format!("state key {key:?} revision changed"))
                 } else {
-                    Error::StateUnavailable(format!("deleting state key {key}: {error}"))
+                    Error::StateUnavailable(format!("deleting state: {error}"))
                 }
-            })
+            })?;
+        Ok(ack.sequence)
     }
 
     async fn watch(&self, prefix: &str) -> Result<StateWatchStream> {
-        let watch_key = if prefix.is_empty() {
-            ">".to_string()
-        } else {
-            format!("{prefix}>")
-        };
-        let watch = self.kv.watch(&watch_key).await.map_err(|error| {
-            Error::StateUnavailable(format!("watching state prefix {prefix:?}: {error}"))
-        })?;
-        Ok(Box::pin(watch.map(map_nats_watch_entry)))
+        let source = self.open_source(prefix).await?;
+        let initial = source.entries.into_iter().map(|entry| {
+            Ok(StateChange {
+                operation: StateOperation::Put,
+                key: entry.key.clone(),
+                revision: entry.revision,
+                entry: Some(entry),
+            })
+        });
+        Ok(Box::pin(
+            futures_util::stream::iter(initial)
+                .chain(futures_util::stream::iter(
+                    source.replayed.into_iter().map(Ok),
+                ))
+                .chain(source.changes),
+        ))
     }
-}
-
-fn map_nats_watch_entry(entry: std::result::Result<Entry, WatcherError>) -> Result<StateChange> {
-    let entry =
-        entry.map_err(|error| Error::StateUnavailable(format!("watching state: {error}")))?;
-    let operation = match entry.operation {
-        Operation::Put => StateOperation::Put,
-        Operation::Delete | Operation::Purge => StateOperation::Delete,
-    };
-    let state_entry = match entry.operation {
-        Operation::Put => Some(StateEntry {
-            key: entry.key.clone(),
-            value: serde_json::from_slice(&entry.value)?,
-            revision: entry.revision,
-        }),
-        Operation::Delete | Operation::Purge => None,
-    };
-    Ok(StateChange {
-        operation,
-        key: entry.key,
-        revision: entry.revision,
-        entry: state_entry,
-    })
 }
 
 fn kv_operation_from_message(message: &Message) -> Operation {
@@ -657,13 +868,20 @@ pub fn validate_nats_headers(headers: &HeaderMap, message: &DeckrMessage) -> Res
 
 async fn open_state_bucket(
     jetstream: &JetStreamContext,
+    client: &async_nats::Client,
+    connection_epoch: &Arc<AtomicU64>,
     bucket: &str,
     policy: StateStorePolicy,
 ) -> Result<NatsStateStore> {
     match jetstream.get_key_value(bucket).await {
         Ok(store) => {
             validate_bucket(&store, bucket, &policy).await?;
-            Ok(NatsStateStore { kv: store, policy })
+            Ok(NatsStateStore {
+                kv: store,
+                policy,
+                client: client.clone(),
+                connection_epoch: connection_epoch.clone(),
+            })
         }
         Err(get_error) => {
             let created = jetstream
@@ -672,7 +890,12 @@ async fn open_state_bucket(
             match created {
                 Ok(store) => {
                     validate_bucket(&store, bucket, &policy).await?;
-                    Ok(NatsStateStore { kv: store, policy })
+                    Ok(NatsStateStore {
+                        kv: store,
+                        policy,
+                        client: client.clone(),
+                        connection_epoch: connection_epoch.clone(),
+                    })
                 }
                 Err(create_error) => {
                     let store = jetstream.get_key_value(bucket).await.map_err(|error| {
@@ -681,7 +904,12 @@ async fn open_state_bucket(
                         ))
                     })?;
                     validate_bucket(&store, bucket, &policy).await?;
-                    Ok(NatsStateStore { kv: store, policy })
+                    Ok(NatsStateStore {
+                        kv: store,
+                        policy,
+                        client: client.clone(),
+                        connection_epoch: connection_epoch.clone(),
+                    })
                 }
             }
         }

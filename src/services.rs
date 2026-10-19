@@ -2,33 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time;
 
-use crate::authority::ContractPointer;
-use crate::beacon::{Beacon, BeaconFeatureEvent, BeaconFeatureEventType, Candidate};
-use crate::canonical_json::canonical_json_hash_value;
+use crate::beacon::{Beacon, Candidate};
+use crate::concord::CreateContractSpec;
 use crate::endpoint::{service_address, EndpointAddress};
-use crate::keys::{
-    encode_key_token, service_use_scope_index_key as make_service_use_scope_index_key,
-};
-use crate::state::{StateStore, StateStorePolicy};
+use crate::keys::encode_key_token;
+use crate::state::StateStore;
 use crate::{Error, Result};
-
-pub const SERVICE_USE_INDEX_SCHEMA_ID: &str = "dev.deckr.service-use-index.v1";
-pub const DEFAULT_SERVICE_USE_INDEX_STORE_NAME: &str = "deckr_service_use_index_v1";
-
-pub fn service_use_index_store_policy() -> StateStorePolicy {
-    StateStorePolicy::persistent("Deckr service-use scope index")
-}
-
-pub fn service_use_scope_index_key(scope_id: &str) -> String {
-    make_service_use_scope_index_key(scope_id)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -238,123 +224,44 @@ impl ServiceAdvertisementPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServiceUseTerms {
-    pub profile: String,
-    pub service_use_scope_id: String,
-    pub service_id: String,
+/// Local authorization policy, never serialized into Concord terms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceAccess {
     pub service_endpoint: EndpointAddress,
     pub service_namespace: String,
     pub service_session_id: String,
-    pub client_endpoint: EndpointAddress,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_operations: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub allowed_views: BTreeMap<String, Vec<String>>,
 }
 
-impl ServiceUseTerms {
-    pub fn from_value(value: Value) -> Result<Self> {
-        let terms: Self = serde_json::from_value(value)?;
-        terms.validate()?;
-        Ok(terms)
+/// A fresh service-use proposal with exactly two participants and no terms.
+pub fn service_use_contract(
+    descriptor: &ServiceDescriptor,
+    client_endpoint: &EndpointAddress,
+    client_session_id: &str,
+) -> Result<CreateContractSpec> {
+    EndpointAddress::parse(client_endpoint.as_str())?;
+    require_text(client_session_id, "client session id")?;
+    require_text(&descriptor.use_profile, "service-use profile")?;
+    require_text(&descriptor.session_id, "service session id")?;
+    if descriptor.endpoint != EndpointAddress::parse(service_address(&descriptor.service_id))?
+        || &descriptor.endpoint == client_endpoint
+    {
+        return Err(Error::Invalid(
+            "service-use requires a service and a distinct client endpoint".into(),
+        ));
     }
-
-    pub fn to_value(&self) -> Result<Value> {
-        self.validate()?;
-        Ok(serde_json::to_value(self)?)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        require_text(&self.profile, "service-use terms profile")?;
-        require_text(&self.service_use_scope_id, "service-use scope id")?;
-        require_text(&self.service_id, "service id")?;
-        require_text(&self.service_namespace, "service namespace")?;
-        require_text(&self.service_session_id, "service session id")?;
-        if self.service_endpoint != EndpointAddress::parse(service_address(&self.service_id))? {
-            return Err(Error::Invalid(
-                "serviceEndpoint must equal service:<serviceId>".to_string(),
-            ));
-        }
-        for operation in &self.allowed_operations {
-            require_text(operation, "service operation")?;
-        }
-        for (family, prefixes) in &self.allowed_views {
-            require_text(family, "service view family")?;
-            for prefix in prefixes {
-                require_text(prefix, "service view prefix")?;
-            }
-        }
-        if self.allowed_operations.is_empty()
-            && !self
-                .allowed_views
-                .values()
-                .any(|prefixes| !prefixes.is_empty())
-        {
-            return Err(Error::Invalid(
-                "service-use terms require operations or views".to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceUseScopeIndexState {
-    Candidate,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServiceUseScopeIndexRecord {
-    #[serde(default = "service_use_index_schema_id", rename = "schema")]
-    pub schema_id: String,
-    pub scope_id: String,
-    pub contract: ContractPointer,
-    pub terms_hash: String,
-    pub service_endpoint: EndpointAddress,
-    pub service_session_id: String,
-    pub client_endpoint: EndpointAddress,
-    pub client_session_id: String,
-    pub state: ServiceUseScopeIndexState,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<ContractPointer>,
-}
-
-impl ServiceUseScopeIndexRecord {
-    pub fn from_value(value: Value) -> Result<Self> {
-        let record: Self = serde_json::from_value(value)?;
-        record.validate()?;
-        Ok(record)
-    }
-
-    pub fn to_value(&self) -> Result<Value> {
-        self.validate()?;
-        Ok(serde_json::to_value(self)?)
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.schema_id != SERVICE_USE_INDEX_SCHEMA_ID {
-            return Err(Error::Invalid(format!(
-                "service-use scope index schema must be {SERVICE_USE_INDEX_SCHEMA_ID}"
-            )));
-        }
-        require_text(&self.scope_id, "service-use scope id")?;
-        self.contract.validate()?;
-        require_text(&self.terms_hash, "service-use terms hash")?;
-        require_text(&self.service_session_id, "service session id")?;
-        require_text(&self.client_session_id, "client session id")?;
-        require_text(&self.created_at, "service-use scope index timestamp")?;
-        require_text(&self.updated_at, "service-use scope index timestamp")?;
-        if let Some(supersedes) = &self.supersedes {
-            supersedes.validate()?;
-        }
-        Ok(())
-    }
+    let mut spec =
+        CreateContractSpec::new(vec![descriptor.endpoint.clone(), client_endpoint.clone()]);
+    spec.profile = Some(descriptor.use_profile.clone());
+    spec.created_by = Some(client_endpoint.clone());
+    spec.participant_sessions.insert(
+        descriptor.endpoint.to_string(),
+        descriptor.session_id.clone(),
+    );
+    spec.participant_sessions
+        .insert(client_endpoint.to_string(), client_session_id.into());
+    Ok(spec)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -425,12 +332,11 @@ pub fn parse_service_descriptor(
     })
 }
 
-pub fn service_use_terms(
+pub fn service_access(
     descriptor: &ServiceDescriptor,
-    client_endpoint: &EndpointAddress,
     operations: impl IntoIterator<Item = impl Into<String>>,
     views: BTreeMap<String, Vec<String>>,
-) -> Result<ServiceUseTerms> {
+) -> Result<ServiceAccess> {
     let mut allowed_operations = operations
         .into_iter()
         .map(Into::into)
@@ -475,31 +381,13 @@ pub fn service_use_terms(
         allowed_views.insert(family, normalized);
     }
 
-    let identity = serde_json::json!({
-        "profile": descriptor.use_profile,
-        "serviceId": descriptor.service_id,
-        "serviceEndpoint": descriptor.endpoint,
-        "serviceNamespace": descriptor.namespace,
-        "serviceSessionId": descriptor.session_id,
-        "clientEndpoint": client_endpoint,
-        "allowedOperations": allowed_operations.clone(),
-        "allowedViews": allowed_views.clone(),
-    });
-    let digest = canonical_json_hash_value(&identity)?;
-    let digest = digest.trim_start_matches("sha256:");
-    let terms = ServiceUseTerms {
-        profile: descriptor.use_profile.clone(),
-        service_use_scope_id: format!("service-use-scope:{}", &digest[..32]),
-        service_id: descriptor.service_id.clone(),
+    Ok(ServiceAccess {
         service_endpoint: descriptor.endpoint.clone(),
         service_namespace: descriptor.namespace.clone(),
         service_session_id: descriptor.session_id.clone(),
-        client_endpoint: client_endpoint.clone(),
         allowed_operations,
         allowed_views,
-    };
-    terms.validate()?;
-    Ok(terms)
+    })
 }
 
 pub fn service_descriptor_sort_key(descriptor: &ServiceDescriptor) -> (String, u64, String) {
@@ -628,6 +516,9 @@ impl<S: StateStore> ServiceDirectory<S> {
 
     pub fn match_services(&self, query: &ServiceQuery) -> Vec<ServiceDescriptor> {
         let inner = self.inner.lock().expect("service directory mutex poisoned");
+        if !inner.current || inner.closed {
+            return Vec::new();
+        }
         let mut keys = inner
             .descriptors_by_key
             .keys()
@@ -682,6 +573,8 @@ impl<S: StateStore> ServiceDirectory<S> {
             let mut inner = self.inner.lock().expect("service directory mutex poisoned");
             inner.closed = true;
             inner.current = false;
+            inner.ready = true;
+            self.ready.notify_waiters();
         }
         if let Some(task) = self
             .watch_task
@@ -703,82 +596,43 @@ impl<S: StateStore> ServiceDirectory<S> {
             {
                 return;
             }
-            match self.beacon.watch(&self.protocol.feature_id) {
-                Ok(mut events) => {
-                    if !self.consume_ready_events(&mut events) {
-                        time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    while let Some(event) = events.next().await {
-                        match event {
-                            Ok(event) => self.apply_event(event, true),
-                            Err(_) => {
-                                self.mark_stale();
-                                break;
+            match self.beacon.watch_state(&self.protocol.feature_id) {
+                Ok(mut snapshots) => {
+                    while let Some(snapshot) = snapshots.next().await {
+                        let mut inner =
+                            self.inner.lock().expect("service directory mutex poisoned");
+                        if inner.closed {
+                            return;
+                        }
+                        let mut replacement = ServiceDirectoryInner {
+                            ready: true,
+                            current: snapshot.current,
+                            closed: snapshot.closed,
+                            ..Default::default()
+                        };
+                        for candidate in snapshot.candidates {
+                            if let Some(descriptor) =
+                                parse_service_descriptor(&candidate, &self.protocol)
+                            {
+                                replacement.add(candidate.key, descriptor);
                             }
+                        }
+                        *inner = replacement;
+                        self.ready.notify_waiters();
+                        if snapshot.closed {
+                            return;
                         }
                     }
                 }
                 Err(_) => {
-                    self.mark_stale();
-                    time::sleep(Duration::from_secs(1)).await;
+                    let mut inner = self.inner.lock().expect("service directory mutex poisoned");
+                    inner.ready = true;
+                    inner.current = false;
+                    self.ready.notify_waiters();
                 }
             }
+            time::sleep(Duration::from_secs(1)).await;
         }
-    }
-
-    fn consume_ready_events(&self, events: &mut crate::beacon::BeaconFeatureWatchStream) -> bool {
-        loop {
-            match events.next().now_or_never() {
-                Some(Some(Ok(event))) => self.apply_event(event, false),
-                Some(Some(Err(_))) | Some(None) => {
-                    self.mark_stale();
-                    return false;
-                }
-                None => {
-                    self.mark_current();
-                    return true;
-                }
-            }
-        }
-    }
-
-    fn apply_event(&self, event: BeaconFeatureEvent, mark_current: bool) {
-        let descriptor = if matches!(
-            event.event_type,
-            BeaconFeatureEventType::Advertised | BeaconFeatureEventType::Updated
-        ) {
-            event
-                .candidate
-                .as_ref()
-                .and_then(|candidate| parse_service_descriptor(candidate, &self.protocol))
-        } else {
-            None
-        };
-        let mut inner = self.inner.lock().expect("service directory mutex poisoned");
-        inner.remove(&event.key);
-        if let Some(descriptor) = descriptor {
-            inner.add(event.key, descriptor);
-        }
-        if mark_current {
-            inner.ready = true;
-            inner.current = true;
-            self.ready.notify_waiters();
-        }
-    }
-
-    fn mark_current(&self) {
-        let mut inner = self.inner.lock().expect("service directory mutex poisoned");
-        inner.ready = true;
-        inner.current = true;
-        self.ready.notify_waiters();
-    }
-
-    fn mark_stale(&self) {
-        let mut inner = self.inner.lock().expect("service directory mutex poisoned");
-        inner.ready = true;
-        inner.current = false;
-        self.ready.notify_waiters();
     }
 }
 
@@ -801,28 +655,6 @@ impl ServiceDirectoryInner {
             index(&mut self.by_view_family, family, &key);
         }
         self.descriptors_by_key.insert(key, descriptor);
-    }
-
-    fn remove(&mut self, key: &str) {
-        let Some(descriptor) = self.descriptors_by_key.remove(key) else {
-            return;
-        };
-        unindex(&mut self.by_service_id, &descriptor.service_id, key);
-        unindex(&mut self.by_namespace, &descriptor.namespace, key);
-        unindex(&mut self.by_use_profile, &descriptor.use_profile, key);
-        unindex(&mut self.by_endpoint, descriptor.endpoint.as_str(), key);
-        unindex_session(
-            &mut self.by_session,
-            descriptor.endpoint.as_str(),
-            &descriptor.session_id,
-            key,
-        );
-        for operation in &descriptor.supported_operations {
-            unindex(&mut self.by_operation, operation, key);
-        }
-        for family in descriptor.views.keys() {
-            unindex(&mut self.by_view_family, family, key);
-        }
     }
 }
 
@@ -909,16 +741,6 @@ fn index(index: &mut BTreeMap<String, BTreeSet<String>>, value: &str, key: &str)
         .insert(key.to_string());
 }
 
-fn unindex(index: &mut BTreeMap<String, BTreeSet<String>>, value: &str, key: &str) {
-    let Some(keys) = index.get_mut(value) else {
-        return;
-    };
-    keys.remove(key);
-    if keys.is_empty() {
-        index.remove(value);
-    }
-}
-
 fn index_session(
     index: &mut BTreeMap<(String, String), BTreeSet<String>>,
     endpoint: &str,
@@ -929,21 +751,6 @@ fn index_session(
         .entry((endpoint.to_string(), session_id.to_string()))
         .or_default()
         .insert(key.to_string());
-}
-
-fn unindex_session(
-    index: &mut BTreeMap<(String, String), BTreeSet<String>>,
-    endpoint: &str,
-    session_id: &str,
-    key: &str,
-) {
-    let Some(keys) = index.get_mut(&(endpoint.to_string(), session_id.to_string())) else {
-        return;
-    };
-    keys.remove(key);
-    if keys.is_empty() {
-        index.remove(&(endpoint.to_string(), session_id.to_string()));
-    }
 }
 
 fn intersect_optional(
@@ -961,10 +768,6 @@ fn intersect_set(keys: &mut BTreeSet<String>, filter: Option<&BTreeSet<String>>)
         Some(filter) => keys.retain(|key| filter.contains(key)),
         None => keys.clear(),
     }
-}
-
-fn service_use_index_schema_id() -> String {
-    SERVICE_USE_INDEX_SCHEMA_ID.to_string()
 }
 
 fn require_text(value: &str, field_name: &str) -> Result<()> {

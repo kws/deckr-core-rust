@@ -177,6 +177,21 @@ fn strict_records_reject_non_object_extension_payloads() {
     assert!(ContractRecord::from_value(contract).is_err());
 }
 
+#[test]
+fn neutral_beacon_and_concord_fixtures_do_not_require_deckr_endpoints() {
+    let advertisement: Value =
+        artifact("fixtures/valid/protocols/beacon/non-deckr-advertisement.v1.json");
+    let advertisement = AdvertisementRecord::from_value(advertisement).unwrap();
+    assert_eq!(advertisement.endpoint.family(), "worker");
+    assert!(EndpointAddress::parse(advertisement.endpoint.as_str()).is_err());
+    let contract: Value = artifact("fixtures/valid/protocols/concord/non-deckr-contract.v1.json");
+    let contract = ContractRecord::from_value(contract).unwrap();
+    assert!(contract
+        .participants
+        .iter()
+        .any(|endpoint| endpoint.family() == "scheduler"));
+}
+
 fn artifact_path(path: &str) -> PathBuf {
     let spec_dir = std::env::var_os("DECKR_SPEC_DIR")
         .map(PathBuf::from)

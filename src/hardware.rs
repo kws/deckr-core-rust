@@ -215,6 +215,7 @@ pub mod runtime {
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use futures_core::Stream;
@@ -705,6 +706,24 @@ pub mod runtime {
         L: HardwareLaneTransport,
     {
         inner: Arc<Mutex<HardwareManagerRuntimeInner<B, C, T, L>>>,
+        lifecycle: Arc<HardwareLifecycle>,
+        sources: MaterializedConcord<C, T>,
+    }
+
+    #[derive(Default)]
+    struct HardwareLifecycle {
+        closed: AtomicBool,
+        started: AtomicBool,
+        active: AtomicUsize,
+        workers: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+        changed: tokio::sync::Notify,
+    }
+    struct WorkerGuard(Arc<HardwareLifecycle>);
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::SeqCst);
+            self.0.changed.notify_waiters();
+        }
     }
 
     impl<B, C, T, L> Clone for HardwareManagerRuntime<B, C, T, L>
@@ -717,6 +736,8 @@ pub mod runtime {
         fn clone(&self) -> Self {
             Self {
                 inner: self.inner.clone(),
+                lifecycle: self.lifecycle.clone(),
+                sources: self.sources.clone(),
             }
         }
     }
@@ -772,6 +793,8 @@ pub mod runtime {
             .profile(HARDWARE_CLAIM_PROFILE_ID.to_string())
             .token_refresh_interval(spec.maintenance_policy.concord_token_refresh_interval);
             Ok(Self {
+                lifecycle: Arc::default(),
+                sources: concord.clone(),
                 inner: Arc::new(Mutex::new(HardwareManagerRuntimeInner {
                     state,
                     beacon_state: spec.beacon_state,
@@ -790,6 +813,12 @@ pub mod runtime {
         }
 
         pub async fn start(&self, tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                return Err(Error::Closed("hardware runtime closed".into()));
+            }
+            if self.lifecycle.started.swap(true, Ordering::SeqCst) {
+                return Err(Error::Invalid("hardware runtime already started".into()));
+            }
             {
                 let inner = self.inner.lock().await;
                 inner.cleanup_stale_advertisement().await?;
@@ -801,32 +830,103 @@ pub mod runtime {
             }
 
             let runtime = self.clone();
-            tasks.spawn(async move { runtime.hardware_command_loop().await });
+            self.spawn_worker(tasks, async move { runtime.hardware_command_loop().await });
             let runtime = self.clone();
-            tasks.spawn(async move { runtime.beacon_refresh_loop().await });
+            self.spawn_worker(tasks, async move { runtime.beacon_refresh_loop().await });
             let runtime = self.clone();
-            tasks.spawn(async move { runtime.concord_watch_loop().await });
+            self.spawn_worker(tasks, async move { runtime.concord_watch_loop().await });
             let runtime = self.clone();
-            tasks.spawn(async move { runtime.concord_token_refresh_loop().await });
+            self.spawn_worker(
+                tasks,
+                async move { runtime.concord_token_refresh_loop().await },
+            );
             let runtime = self.clone();
-            tasks.spawn(async move { runtime.periodic_reconcile_loop().await });
+            self.spawn_worker(
+                tasks,
+                async move { runtime.periodic_reconcile_loop().await },
+            );
             Ok(())
         }
 
+        fn spawn_worker(
+            &self,
+            tasks: &mut JoinSet<Result<()>>,
+            future: impl Future<Output = Result<()>> + Send + 'static,
+        ) {
+            self.lifecycle.active.fetch_add(1, Ordering::SeqCst);
+            let guard = WorkerGuard(self.lifecycle.clone());
+            let runtime = self.clone();
+            let handle = tasks.spawn(async move {
+                let result = future.await;
+                drop(guard);
+                if result.is_err() {
+                    runtime.lifecycle.closed.store(true, Ordering::SeqCst);
+                    runtime.sources.close_sources();
+                    tokio::spawn(async move {
+                        let _ = runtime.stop().await;
+                    });
+                }
+                result
+            });
+            self.lifecycle
+                .workers
+                .lock()
+                .expect("worker lock poisoned")
+                .push(handle);
+        }
+
         pub async fn stop(&self) -> Result<()> {
+            self.lifecycle.closed.store(true, Ordering::SeqCst);
+            for worker in self
+                .lifecycle
+                .workers
+                .lock()
+                .expect("worker lock poisoned")
+                .drain(..)
+            {
+                worker.abort();
+            }
+            let runtime = self.clone();
+            // The bounded cleanup owns its lifetime even if the caller is cancelled.
+            tokio::spawn(async move {
+                let result = time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let changed = runtime.lifecycle.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        if runtime.lifecycle.active.load(Ordering::SeqCst) == 0 {
+                            break;
+                        }
+                        changed.await;
+                    }
+                    runtime.stop_inner().await
+                })
+                .await
+                .map_err(|_| Error::StateUnavailable("hardware cleanup deadline exceeded".into()))
+                .and_then(|result| result);
+                runtime.sources.close_sources_and_wait().await;
+                result
+            })
+            .await
+            .map_err(|error| Error::StateUnavailable(format!("hardware cleanup failed: {error}")))?
+        }
+
+        async fn stop_inner(&self) -> Result<()> {
             let mut inner = self.inner.lock().await;
             inner.closed = true;
-            let managed_keys = inner
-                .claim_manager
-                .managed_contracts()
-                .into_iter()
-                .map(|managed| managed.contract.key)
-                .collect::<Vec<_>>();
-            for key in managed_keys {
-                inner.claim_manager.release_withdraw(&key).await?;
-            }
             inner.state.routing = HardwareClaimRouting::default();
-            inner.withdraw_advertisement().await
+            inner.claim_manager.revoke_lost_authority();
+            let managed_keys = inner.claim_manager.owned_contract_keys();
+            let mut failure = None;
+            for key in managed_keys {
+                if let Err(error) = inner.claim_manager.release_withdraw(&key).await {
+                    failure = Some(error);
+                }
+            }
+            if let Err(error) = inner.withdraw_advertisement().await {
+                failure = Some(error);
+            }
+            failure.map_or(Ok(()), Err)
         }
 
         pub async fn set_device(&self, descriptor: DeviceDescriptor) -> Result<()> {
@@ -870,8 +970,20 @@ pub mod runtime {
         }
 
         pub async fn handle_hardware_message(&self, body: HardwareMessageBody) -> Result<()> {
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let (message, lane) = {
-                let inner = self.inner.lock().await;
+                let mut inner = self.inner.lock().await;
+                let claim_key = inner
+                    .state
+                    .routing
+                    .claims
+                    .get(&body.device_ref().device_id)
+                    .map(|route| route.contract_key.clone());
+                if !claim_key.is_some_and(|key| inner.claim_manager.has_current_authority(&key)) {
+                    return Ok(());
+                }
                 (
                     inner.state.route_hardware_message(body)?,
                     inner.lane.clone(),
@@ -884,6 +996,9 @@ pub mod runtime {
         }
 
         async fn handle_command(&self, envelope: DeckrMessage) -> Result<()> {
+            if self.lifecycle.closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             let mut decision = {
                 let inner = self.inner.lock().await;
                 inner.state.authorize_command(envelope.clone())?
@@ -905,7 +1020,19 @@ pub mod runtime {
             match decision {
                 HardwareCommandDecision::Authorized => {
                     let handler = {
-                        let inner = self.inner.lock().await;
+                        let mut inner = self.inner.lock().await;
+                        let Some(pointer) = &envelope.contract else {
+                            return Ok(());
+                        };
+                        let key = crate::concord::concord_contract_key(
+                            &pointer.contract_id,
+                            pointer.generation,
+                        );
+                        if self.lifecycle.closed.load(Ordering::SeqCst)
+                            || !inner.claim_manager.has_current_authority(&key)
+                        {
+                            return Ok(());
+                        }
                         inner.command_handler.clone()
                     };
                     let outcome = handler.handle_hardware_command(envelope.clone()).await?;

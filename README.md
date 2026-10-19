@@ -13,7 +13,8 @@ implementation code and tests; it does not define or generate the specification.
 - Rust 1.88 or newer, with Cargo, rustfmt, and Clippy.
 - A checkout of `kws/deckr` for the optional conformance tests.
 - A JetStream-enabled NATS server when running an application with the `nats`
-  feature. The current test suite does not require a running broker.
+  feature. Ordinary tests do not require a running broker; the optional live
+  NATS regression test does.
 
 [mise](https://mise.jdx.dev/) users can install the configured toolchain with
 `mise install`.
@@ -45,6 +46,43 @@ assert_eq!(
 );
 # Ok::<(), deckr::Error>(())
 ```
+
+### Runtime lifetimes and state views
+
+Materialized stores install complete snapshots and consume ordered observations.
+Exact mutations wait for their committed revision to arrive through the watch;
+they never inject state into the cache. Custom `StateStore` adapters used with
+materialized views must implement `open_source` with an atomic snapshot/watch
+boundary and `delete_revision` with the committed deletion revision. Source gaps
+must be reported even if transport recovery succeeds immediately.
+
+Prefer `MaterializedStateStore::watch_snapshots`, `Beacon::watch_state`, and
+materialized `ConcordCoordinator::watch_state` for public state subscriptions.
+Each item carries complete filtered membership, a version and currentness.
+Changes coalesce for slow readers; more than 256 changed identities sets
+`resnapshot_required`. Registration 257 fails explicitly. The older event APIs
+remain compatibility adapters over these snapshots.
+
+Concord participant handles permanently lose authority after required renewal
+failure, token expiry, or loss of source continuity. Rebuilt views do not restore
+those handles. Recovery requires a new contract. Hardware routing checks current
+local authority at dispatch, and `HardwareManagerRuntime::stop` cancels its owned
+workers, bounds remote cleanup to five seconds, and closes its sources. The
+caller can drain the supplied `JoinSet` after stopping; it need not abort workers.
+
+### API migration notes
+
+- Beacon and Concord accept protocol-neutral endpoint families. Use
+  `EndpointAddress::parse_protocol` for these identities; `parse` retains Deckr's
+  endpoint restrictions for Deckr messages and profiles.
+- Service-use agreements are termless. Replace the old service terms, terms-hash,
+  and scope-index helpers with `service_use_contract`. It returns a fresh contract
+  intent with both endpoint sessions. Keep namespace, operation, and view
+  permissions in local `ServiceAccess`, constructed by `service_access`.
+- Ordinary NATS startup opens the three participation buckets. Maintenance is an
+  optional capability obtained explicitly with
+  `runtime.nats().concord_maintenance().await?`; it is no longer a `RuntimeBucket`
+  variant or a startup readiness dependency.
 
 ## Repository layout
 
@@ -90,6 +128,15 @@ cargo doc --locked --no-deps --features nats
 
 These commands need only this repository and its Cargo dependencies. The `nats`
 feature is compiled and tested without opening a broker connection.
+
+To exercise consumer cleanup, source recovery, and optional maintenance against
+a disposable JetStream broker, run:
+
+```bash
+DECKR_NATS_TEST_URL=nats://127.0.0.1:4222 cargo test --locked --features nats --test nats_runtime -- --ignored
+```
+
+The test uses isolated bucket names and deletes its buckets after success.
 
 ## Upstream conformance tests
 

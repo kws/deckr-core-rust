@@ -106,6 +106,12 @@ impl RecordingStateStore {
 }
 
 impl StateStore for RecordingStateStore {
+    async fn open_source(&self, prefix: &str) -> Result<deckr::state::StateSource> {
+        self.inner.open_source(prefix).await
+    }
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
+        self.inner.delete_revision(key, revision).await
+    }
     async fn ttl_seconds(&self) -> Result<Option<u64>> {
         self.inner.ttl_seconds().await
     }
@@ -154,6 +160,12 @@ impl StateStore for RecordingStateStore {
 }
 
 impl StateStore for RacingUpdateStore {
+    async fn open_source(&self, prefix: &str) -> Result<deckr::state::StateSource> {
+        self.inner.open_source(prefix).await
+    }
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
+        self.inner.delete_revision(key, revision).await
+    }
     async fn ttl_seconds(&self) -> Result<Option<u64>> {
         self.inner.ttl_seconds().await
     }
