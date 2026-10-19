@@ -1,8 +1,36 @@
-[workspace]
-members = ["rust/deckr"]
-resolver = "2"
-
-[workspace.package]
-edition = "2021"
-license = "MIT"
+[package]
+name = "deckr"
 version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Rust implementation of the Deckr protocols and shared runtime"
+readme = "README.md"
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[features]
+default = []
+nats = ["dep:async-nats"]
+# Enable the integration test target that reads fixtures from kws/deckr.
+conformance = []
+
+[[test]]
+name = "conformance"
+required-features = ["conformance"]
+
+[dependencies]
+async-nats = { version = "0.47", default-features = false, features = ["kv", "ring", "server_2_11"], optional = true }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-channel = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+thiserror = "2.0"
+tokio = { version = "1.39", features = ["rt", "sync", "time"] }
+uuid = { version = "1.23", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }

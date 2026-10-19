@@ -1,0 +1,74 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out implementation
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.88.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint all targets and features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test default features without a spec checkout
+        env:
+          DECKR_SPEC_DIR: ${{ github.workspace }}/.missing-spec
+        run: cargo test --locked
+
+      - name: Test NATS feature
+        run: cargo test --locked --features nats
+
+      - name: Build all features
+        run: cargo build --locked --all-features
+
+      - name: Build API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+      - name: Verify crate package
+        run: cargo package --locked
+
+  conformance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out implementation
+        uses: actions/checkout@v6
+
+      - name: Read upstream spec revision
+        id: spec
+        run: echo "revision=$(cat spec-revision)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out upstream specification
+        uses: actions/checkout@v6
+        with:
+          repository: kws/deckr
+          ref: ${{ steps.spec.outputs.revision }}
+          path: .deckr-spec
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+
+      - name: Test all features and upstream conformance
+        env:
+          DECKR_SPEC_DIR: ${{ github.workspace }}/.deckr-spec
+        run: cargo test --locked --all-features

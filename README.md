@@ -1,332 +1,132 @@
-# deckr
+# Deckr Rust implementation
 
-`deckr` is the shared core for the Deckr ecosystem.
+This repository contains the `deckr` Rust crate: a reusable, controller-independent
+implementation of the Deckr protocols and shared runtime.
 
-It owns the reusable runtime model, lane contracts, message contracts, and
-wire-safe schemas that other Deckr components build on without pulling in
-controller-specific policy.
-That includes:
-
-- the `Component` runtime abstraction
-- core message lanes such as `hardware_messages` and `services`
-- core Deckr message specifications and identity rules
-- shared runtime utilities such as component lifecycle support and lane/substrate
-  helpers
-- hardware-facing and action-provider-facing shared models
-
-The normative architecture and protocol references now live in:
-
-- [docs/runtime-architecture.md](docs/runtime-architecture.md)
-- [docs/runtime-modes.md](docs/runtime-modes.md)
-- [docs/migration-guide.md](docs/migration-guide.md)
-- [docs/beacon.md](docs/beacon.md)
-- [docs/concord.md](docs/concord.md)
-- [docs/nats.md](docs/nats.md)
-
-Those documents are the source of truth for the current architecture and
-protocol contract. They are explicitly normative, alpha-stage, and
-intentionally non-backward-compatible.
-API examples and operational procedures are in the non-normative
-[runtime reference](docs/protocol-runtime-reference.md).
-The distributed bus replacement has closed on NATS as the Deckr distributed
-substrate: Core NATS carries lane traffic and JetStream KV carries current
-state. The supported NATS/KV contract now lives in
-[docs/nats.md](docs/nats.md). Future bus ideas live outside this package
-until they become implementor- or user-relevant specification.
-
-The controller now lives in its own sibling repository:
-
-- `https://github.com/kws/deckr-controller`
-
-## Repository Layout
-
-```text
-src/deckr/
-  components/  Public component model, lifecycle manager, and component host
-  contracts/   Wire-safe message, envelope, endpoint, and lane contracts
-  core/        Generic config, logging, and runtime utility helpers
-  actions/     Runtime-neutral actions lane body and endpoint contracts
-  beacon.py    Generic feature advertisement discovery protocol
-  concord.py   Generic participant-token contract protocol
-  profiles/    Deckr hardware/action Beacon payloads and Concord terms
-  hardware/    Hardware-facing shared contracts and wire models
-  substrates/  Message bus implementations, currently NATS
-  lanes.py     Endpoint sessions, lane views, and message validation
-  runtime.py   Managed Deckr runtime context for lanes and endpoint lifecycle
-docs/
-  beacon.md
-  concord.md
-  migration-guide.md
-  nats.md
-  protocol-runtime-reference.md
-  runtime-architecture.md
-  runtime-modes.md
-contract/v1/
-  index.html
-  manifest.json
-  schemas/
-  fixtures/
-  vectors/
-rust/deckr/
-  src/        Rust implementation of shared contract primitives
-  tests/      Rust conformance tests against contract/v1 artifacts
-typescript/deckr/
-  src/        TypeScript implementation of shared contract primitives
-  tests/      TypeScript conformance and lifecycle tests
-tests/
-```
-
-The generated `contract/v1/` bundle is the checked, language-neutral v1
-contract artifact set. Open `contract/v1/index.html` locally to browse the
-manifest, schemas, fixtures, and vectors. Regenerate it with:
-
-```bash
-uv run python scripts/generate_contract_artifacts.py
-```
+The specifications, schemas, catalogs, fixtures, and conformance vectors are
+maintained in [kws/deckr](https://github.com/kws/deckr), normally checked out at
+`../deckr`. Protocol changes belong there first. This repository contains Rust
+implementation code and tests; it does not define or generate the specification.
 
 ## Requirements
 
-- Python 3.11+
-- `uv`
+- Rust 1.88 or newer, with Cargo, rustfmt, and Clippy.
+- A checkout of `kws/deckr` for the optional conformance tests.
+- A JetStream-enabled NATS server when running an application with the `nats`
+  feature. The current test suite does not require a running broker.
 
-## Quick Start
+[mise](https://mise.jdx.dev/) users can install the configured toolchain with
+`mise install`.
 
-Install the project and development tooling:
+## Using the crate
 
-```bash
-uv sync
+For a sibling application, add a path dependency:
+
+```toml
+[dependencies]
+deckr = { path = "../deckr-core-rust" }
 ```
 
-Run the default validation suite:
+Enable the optional NATS runtime and JetStream KV adapter with
+`features = ["nats"]` on that dependency. The default features provide protocol
+models, validation, discovery, agreement, hardware and service helpers, and state
+store abstractions without the NATS dependency.
 
-```bash
-uv run ruff check .
-uv run lint-imports
-uv run pytest
-uv run pytest --cov-branch --cov-report=json:coverage.json
-uv run python scripts/check_lifecycle_branch_coverage.py coverage.json
+For example, parse an endpoint and derive its direct message subject:
+
+```rust
+use deckr::endpoint::EndpointAddress;
+use deckr::lanes::direct_subject;
+
+let endpoint = EndpointAddress::parse("controller:main")?;
+assert_eq!(
+    direct_subject("hardware_messages", &endpoint)?,
+    "deckr.msg.hardware_messages.to.controller.main"
+);
+# Ok::<(), deckr::Error>(())
 ```
 
-Focused protocol tests should import `MemoryJsonKvBucket`,
-`ConcordRuntimeHarness`, or `ConcordMaintenanceHarness` from `deckr.testing`.
-Use the runtime harness for ordinary Concord tests and the maintenance harness
-only for reaper/maintenance coverage. Normal `Concord` accepts only contract
-and token stores; dedicated maintenance code imports `ConcordMaintenance` and
-`ConcordReaperService` from `deckr.concord_maintenance`. See the
-[migration guide](docs/migration-guide.md#test-rewrites) for examples.
+## Repository layout
 
-Run the TypeScript core conformance checks:
-
-```bash
-cd typescript/deckr
-npm install
-npm test
-npm run typecheck
+```text
+Cargo.toml             Crate metadata, features, and dependencies
+Cargo.lock             Locked dependencies
+src/
+  lib.rs               Public module exports
+  endpoint.rs          Endpoint identities
+  lanes.rs             Message models, validation, and subject/header helpers
+  beacon.rs            Discovery implementation
+  concord.rs           Agreement implementation
+  authority.rs         Contract pointers
+  canonical_json.rs    Canonical serialization and terms hashing
+  keys.rs              Storage key encoding
+  state.rs             State stores, watches, and materialized views
+  hardware.rs          Hardware manager runtime
+  profiles/            Hardware discovery and claim models
+  services.rs          Service discovery and selection
+  nats.rs              Optional NATS runtime and JetStream KV adapter
+tests/                 Rust integration and upstream conformance tests
+spec-revision          Upstream spec commit used by CI
+.github/workflows/     Rust validation
 ```
 
-Build distributables:
+Keep reusable implementation here. Controller orchestration, rendering policy,
+controller configuration, and device-manager-specific behavior belong in the
+components that own them, such as
+[deckr-controller](https://github.com/kws/deckr-controller).
+
+## Development
+
+Run standalone checks from this repository's root:
 
 ```bash
-uv build
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --features nats -- -D warnings
+cargo test --locked
+cargo test --locked --features nats
+cargo build --locked --features nats
+cargo doc --locked --no-deps --features nats
 ```
 
-## Architecture
+These commands need only this repository and its Cargo dependencies. The `nats`
+feature is compiled and tested without opening a broker connection.
 
-Deckr’s target architecture is:
+## Upstream conformance tests
 
-- one runtime abstraction: `Component`
-- one shared discovery/agreement model: Beacon advertisements for weak
-  feature discovery and Concord contracts for live agreements
-- named event lanes as the only generic wiring primitive
-- shared lane infrastructure for application-facing send/subscribe/fan-out
-- NATS as the distributed message bus rather than Deckr-specific
-  WebSocket/MQTT lane transports
-- core message and endpoint identity contracts defined in `deckr`
-- standard messaging substrates used before Deckr builds generic broker features
-  itself
-- stable endpoint addresses and explicit subjects that are separate from
-  component runtime ids, transport ids, sessions, topics, and paths
-
-Controllers, hardware managers, action provider runtimes, and protocol adapters
-are semantic roles, not different architectural kinds.
-
-Beacon is only candidate discovery. After participants negotiate a Concord
-contract, that contract's validity and withdrawal are governed by Concord
-contracts and participant tokens, not by continued Beacon advertisement
-presence.
-The Python runtime owns Beacon/Concord materialized KV views, reconciles watch
-recovery snapshots, and coalesces no-op heartbeat writes behind TTL-derived
-cadence rules. The optional Concord reaper is the maintenance exception: it runs
-infrequently through a separate task-free `ConcordMaintenance` capability and
-uses exact raw KV scans to clear orphaned stale observations and bound the
-cancelled-contract archive. Normal Concord startup never opens or waits for the
-maintenance store.
-
-If you are looking for the design rules around discovery, endpoint sessions,
-message bus configuration, wire-safe schemas, component planning, and alpha
-policy, read [docs/runtime-architecture.md](docs/runtime-architecture.md).
-Public contract identifier ownership and collision-avoidance rules live in
-[docs/namespaces.md](docs/namespaces.md).
-Beacon and Concord protocol semantics for non-Python implementors live in
-[the Beacon specification](docs/beacon.md) and
-[the Concord specification](docs/concord.md).
-
-The Deckr distributed message bus is NATS. Read
-[docs/nats.md](docs/nats.md) for endpoint sessions, recipient
-filtering, and shared KV storage rules. The Beacon and Concord specifications
-define their protocol stores. Broker diagnostics are in the
-[runtime reference](docs/protocol-runtime-reference.md#74-jetstream-consumers).
-
-The old home-grown WebSocket/MQTT lane transports, route table, route leases,
-route metadata, and remote-endpoint hint architecture are removal targets. This
-does not apply to adapter-private protocols such as external runtime attach,
-third-party plugin protocol adaptation, or concrete device protocols.
-
-The NATS substrate surface is available behind the optional `deckr[nats]` extra.
-Use `Deckr.endpoint(...)` for endpoint-session lane messages, `Deckr.beacon` for
-managed Beacon discovery, `Deckr.concord` for managed agreement state, and
-`Deckr.kv_bucket(...)` for explicit NATS KV buckets. Service consumers use the
-managed `Deckr.services(endpoint)` context and `DeckrServices.use_matching(...)`
-from `deckr.services`; that managed client owns service discovery, service-use
-candidate races and successor negotiation, request authority, and protected
-view reads/watches. Consumers must not scan Beacon KV, duplicate descriptor
-parsing loops, classify Concord terminal statuses, or query Concord as a
-catalog. Direct Beacon/Concord primitives and direct `ServiceViewStore`
-construction are for core runtime, service infrastructure, hardware
-infrastructure, and conformance tests.
-The optional
-`deckr[supervised-nats]` extra also installs the first-party
-`deckr-nats-server-bin` binary package so embedded hosts and the `deckr` launcher
-can supervise a private local `nats-server` process. This is still the same
-NATS/KV runtime contract, not an in-memory or no-NATS product mode.
-
-`scripts/nats_state_report.py` summarizes the broker's current Deckr
-Beacon/Concord communication state. The
-[runtime reference](docs/protocol-runtime-reference.md#74-jetstream-consumers)
-also covers JetStream consumer checks for watch paths.
+The `conformance` feature enables a separate test target that reads the upstream
+fixtures and vectors at runtime. It does not add a runtime API or dependency.
+The default spec checkout is `../deckr`; set `DECKR_SPEC_DIR` to use another
+checkout. The variable names the repository root, which contains `contract/v1/`.
+Missing or invalid artifacts fail the tests with the path that could not be read.
 
 ```bash
-uv run --extra nats python scripts/nats_state_report.py --url nats://127.0.0.1:4222
+git clone https://github.com/kws/deckr.git ../deckr
+git -C ../deckr checkout "$(cat spec-revision)"
+cargo test --locked --all-features
 ```
 
-## Package Boundaries
-
-The core architectural rule is that `deckr` stays reusable and controller-free.
-If code is specific to orchestration, rendering policy, device lifecycle
-management, controller configuration, or controller-owned state, it belongs in
-`deckr-controller`, not here.
-
-Internal boundaries are enforced with `.importlinter`:
-
-- `deckr.core` must not import `deckr.hardware`
-- `deckr.core` must not import `deckr.actions`
-- `deckr.contracts` must not import `deckr.actions` or `deckr.hardware`
-- `deckr.hardware` must not import `deckr.actions`
-
-Run the contract checks with:
+For an existing checkout elsewhere:
 
 ```bash
-uv run lint-imports
+DECKR_SPEC_DIR=/path/to/deckr cargo test --locked --features conformance --test conformance
 ```
 
-## Deckr Message Protocols
-
-Deckr's core message protocols are the contracts spoken between Deckr
-architectural endpoints such as controllers, action providers, and hardware
-managers. They are separate from transport protocols such as MQTT and WebSocket,
-and separate from adapter-private third-party protocols.
-
-The supported message bus and protocol-store model is defined in
-[docs/nats.md](docs/nats.md). `deckr.action_runtime`,
-`deckr.actions.messages`, and `deckr.actions.endpoints` contain the shared
-Action Runtime service contracts used by controllers, action provider runtimes,
-service bus adapters, and non-Python implementations. The v1 action contract is
-capability-native: action descriptors may declare capability requirements,
-lifecycle messages carry structured action-instance, binding, and page-session
-metadata, input is represented as capability input, and output requests target
-matched capabilities through generation-scoped binding output.
-
-Dynamic page commands carry one target per child binding. A child may target
-`self`, meaning the page opener's current action instance, or it may target an
-explicit action selector that the controller resolves to an action provider
-instance and page-scoped child action instance. Providers do not send
-`actionInstanceId` values for dynamic children; those live identities remain
-controller-owned.
-
-In particular, endpoint addresses such as `controller:<controller_id>`,
-`service:<service_id>`, and `hardware_manager:<manager_id>` are protocol
-addressing identities. They are not launcher runtime names, action provider
-runtime ids, WebSocket connection ids, MQTT topics, or concrete hardware ids.
-Device, control, capability, action, context, profile, and page references are
-subjects carried by lane messages, not transport locators.
-
-The key output rule is:
-
-- core action output targets a matched capability through binding-scoped
-  commands such as raster `set_frame` and `clear`; third-party command names
-  belong only at adapter boundaries.
-
-## Hardware Package
-
-The shared hardware package lives at `deckr.hardware`.
-
-Import `deckr.hardware` directly in all code and docs.
+CI checks out the commit recorded in `spec-revision` and runs both standalone and
+conformance checks. When updating to a new spec revision, review the upstream
+changes, update the commit in that file, and run the full checks against that
+checkout. The upstream commit must be available in `kws/deckr` before CI can fetch
+it. Passing the current test suite covers the implemented cases; it does not
+claim complete protocol conformance.
 
 ## Releases
 
-This repository now releases a single distribution: `deckr`.
+The crate version is owned by the root `Cargo.toml`. Keep `Cargo.lock` updated
+when changing the version or dependencies. Run the checks above and the upstream
+conformance tests before a release, and verify the distributable with:
 
-- The source of truth for the published version is the root `pyproject.toml`.
-- Use package tags in the form `deckr-vX.Y.Z`.
-- Stable releases use normal PEP 440 versions such as `0.3.0`.
-- After each stable release, bump immediately to the next development line,
-  e.g. `0.4.0.dev0`, in a separate follow-up commit.
+```bash
+cargo package --locked
+```
 
-### Release Flow
-
-1. Update `version` in `pyproject.toml` to the stable release number.
-2. Run the validation suite:
-
-   ```bash
-   uv run ruff check .
-   uv run lint-imports
-   uv run pytest
-   ```
-
-3. Refresh the lockfile:
-
-   ```bash
-   uv lock --refresh
-   ```
-
-4. Commit the release, for example:
-
-   ```bash
-   git commit -am "chore(deckr): release v0.3.0"
-   ```
-
-5. Tag the release commit:
-
-   ```bash
-   git tag deckr-v0.3.0
-   ```
-
-6. Build from the tag so the artifacts match the stable version exactly:
-
-   ```bash
-   git checkout deckr-v0.3.0
-   uv build
-   git checkout -
-   ```
-
-7. Publish the wheel and sdist using your usual PyPI workflow.
-8. Immediately bump `pyproject.toml` to the next development version, refresh
-   the lockfile, and commit that separately:
-
-   ```bash
-   uv lock --refresh
-   git commit -am "chore(deckr): bump to development release 0.4.0.dev0"
-   ```
-
-The stable tag should always point at the stable release commit, not the later
-`.dev0` commit.
+Release artifacts contain the Rust library and its implementation documentation.
+Specification releases are managed separately in `kws/deckr`.

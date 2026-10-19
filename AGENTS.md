@@ -1,87 +1,46 @@
 # AGENTS.md
 
-This file adds agent-specific guidance for the `deckr` repository.
+This repository is the Rust-only Deckr implementation. Use [README.md](README.md)
+for setup, crate usage, validation, and releases.
 
-Use [README.md](./README.md) as the primary source of truth for setup, package
-purpose, and the human-facing release workflow. Keep shared guidance in the
-README and use this file for placement rules and implementation hints.
+## Scope and source of truth
 
-## What Lives Here
+- Keep Rust implementation, Rust tests, and implementation documentation here.
+- The specification is maintained in `kws/deckr`, normally at `../deckr`.
+  Protocol changes belong there first; do not add local specification documents,
+  schemas, catalogs, fixtures, or vector bundles.
+- Do not introduce Python or TypeScript source, tooling, or package metadata.
+- Keep controller orchestration, rendering policy, filesystem configuration, and
+  device-manager-specific behavior in the components that own them.
 
-`deckr` is the controller-independent Python core for the Deckr ecosystem.
+## Layout
 
-Use this repo for:
+- Root `Cargo.toml` defines the `deckr` library crate and its features.
+- `src/` contains protocol models, runtime helpers, and adapters.
+- `tests/` contains standalone Rust integration tests and a separate `conformance`
+  target that reads upstream artifacts.
+- `spec-revision` pins the upstream spec commit for CI. Use `DECKR_SPEC_DIR` to
+  select an alternate checkout when testing local upstream changes.
 
-- shared hardware contracts and wire models
-- action-provider-facing manifests, messages, and lifecycle primitives
-- reusable runtime utilities that are not controller-specific
+Preserve the controller-independent public API. Keep generic runtime and storage
+utilities independent of hardware and service policy. Gate NATS integration
+behind the existing `nats` feature.
 
-Do not place controller orchestration, rendering policy, filesystem config, or
-device-manager-specific behavior here. That belongs in the sibling
-`deckr-controller` repo.
-
-## Directory Guide
-
-- `src/deckr/core`
-  - Generic runtime utilities and messaging primitives.
-  - Must not depend on `deckr.hardware` or `deckr.actions`.
-- `src/deckr/actions`
-  - Runtime-neutral `actions` lane wire contracts, provider-instance catalogs,
-    settings targets, endpoint helpers, and action-facing capability contracts.
-- `src/deckr/hardware`
-  - Shared hardware-facing contracts.
-  - Must not depend on `deckr.actions`.
-- `tests`
-  - Tests for the core package only.
-
-## Placement Rules
-
-- Put code in `deckr` only if it is intended to be reused by multiple Deckr
-  components.
-- Prefer a narrow dependency surface. Small, stable contracts are better than
-  moving implementation details here for convenience.
-- If a change starts to look controller-specific, stop and move it to
-  `deckr-controller`.
-
-## Dependency Rules
-
-These are enforced in [`.importlinter`](./.importlinter):
-
-- `deckr.core` must not import `deckr.hardware`
-- `deckr.core` must not import `deckr.actions`
-- `deckr.contracts` must not import `deckr.actions` or `deckr.hardware`
-- `deckr.hardware` must not import `deckr.actions`
-
-After touching package boundaries or import structure, run:
+## Validation
 
 ```bash
-uv run lint-imports
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo test --locked --all-features
+cargo build --locked --all-features
+cargo doc --locked --no-deps --all-features
 ```
 
-## Development Commands
+The conformance target requires `../deckr` or `DECKR_SPEC_DIR`. Its fixtures and
+vectors must be read from that checkout, never generated or copied into this
+repository. Run default-feature tests as well so ordinary development remains
+independent of a spec checkout and NATS.
 
-Use `uv` consistently:
-
-```bash
-uv sync
-uv run ruff check .
-uv run lint-imports
-uv run pytest
-uv build
-```
-
-## Release Notes
-
-Do not duplicate the full release procedure here; follow the release section in
-[README.md](./README.md#releases).
-
-Short version:
-
-- root `pyproject.toml` owns the published `deckr` version
-- tag stable releases as `deckr-vX.Y.Z`
-- after a stable release, bump immediately to the next `X.(Y+1).0.dev0`
-- refresh `uv.lock` after every version change
-
-## Hardware Imports
-
-Use `deckr.hardware` directly in code, tests, and documentation.
+Use Cargo SemVer versions in the root manifest and follow the README release
+guidance. Specification versions and releases belong to the upstream repo.
