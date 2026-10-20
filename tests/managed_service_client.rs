@@ -444,6 +444,10 @@ async fn accepted_service_survives_discovery_replacement_and_negotiates_fresh_su
         .contract_id
         .clone();
     let mut states = client.watch_state().unwrap();
+    assert_eq!(
+        client.state().value.contract.as_ref().unwrap().contract_id,
+        pointer
+    );
     states.next().await;
     h.advertisements.delete(&ad.key, None).await.unwrap();
     until(|| h.directory.descriptors().is_empty()).await;
@@ -482,6 +486,10 @@ async fn accepted_service_survives_discovery_replacement_and_negotiates_fresh_su
     })
     .await;
     let fresh = client.connection().unwrap();
+    assert_eq!(
+        client.state().value.contract.as_ref().unwrap().contract_id,
+        fresh.context().agreement().contract().contract_id
+    );
     assert_ne!(fresh.context().agreement().contract().contract_id, pointer);
     assert!(connection.authorize().is_err());
     assert_eq!(

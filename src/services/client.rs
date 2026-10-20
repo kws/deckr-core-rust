@@ -101,6 +101,8 @@ pub struct ServiceClientState {
     pub admitted: Vec<ServiceCandidateIdentity>,
     pub selected: Option<ServiceDescriptor>,
     pub agreement: Option<AgreementState>,
+    /// Observed agreement identity; operations still check current authority.
+    pub contract: Option<crate::authority::ContractPointer>,
     pub local_authority: bool,
     pub rounds: u64,
     pub attempts: u64,
@@ -227,6 +229,7 @@ impl<C: StateStore, T: StateStore, M: MessageTransport> Shared<C, T, M> {
                 ServiceClientStatus::Connecting
             };
             state.value.selected = None;
+            state.value.contract = None;
             true
         });
     }
@@ -446,6 +449,7 @@ async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
         state.current = false;
         state.value.local_authority = false;
         state.value.selected = None;
+        state.value.contract = None;
         true
     });
 }
@@ -774,6 +778,11 @@ async fn hold<B: StateStore, C: StateStore, T: StateStore, M: MessageTransport>(
         state.value.local_authority = true;
         state.value.selected = Some(connection.context().descriptor().clone());
         state.value.agreement = Some(connection.context().agreement().state().value);
+        let contract = connection.context().agreement().contract();
+        state.value.contract = Some(crate::authority::ContractPointer {
+            contract_id: contract.contract_id.clone(),
+            generation: contract.generation,
+        });
         state.failure = None;
         true
     });

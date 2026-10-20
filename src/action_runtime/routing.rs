@@ -78,160 +78,25 @@ impl CapabilityRequirementSelector {
                 .all(|command| capability.command_types.contains(command)))
     }
 }
-fn view_matches(views: &[CapabilityView], provenance: CapabilityProvenance) -> bool {
-    views.is_empty()
-        || views.iter().any(|view| {
-            matches!(
-                (view, provenance),
-                (
-                    CapabilityView::Raw | CapabilityView::Native,
-                    CapabilityProvenance::Native
-                ) | (CapabilityView::Projected, CapabilityProvenance::Projection)
-                    | (CapabilityView::Derived, CapabilityProvenance::Derivation)
-                    | (CapabilityView::Extension, CapabilityProvenance::Extension)
-            )
-        })
-}
-fn satisfies(
-    requirement: &CapabilityRequirement,
-    matched: &MatchedCapability,
-    capability: &CapabilityDescriptor,
-) -> Result<bool> {
-    if matched
-        .requirement_name
-        .as_ref()
-        .is_some_and(|name| name != &requirement.name)
-    {
-        return Ok(false);
-    }
-    Ok(requirement
-        .preferences
-        .iter()
-        .map(|selector| selector.matches(capability))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .any(|matches| matches)
-        && requirement.event_types.iter().all(|event| {
-            capability.event_types.contains(event)
-                && (matched.event_types.is_empty() || matched.event_types.contains(event))
-        })
-        && requirement.command_types.iter().all(|command| {
-            capability.command_types.contains(command)
-                && (matched.command_types.is_empty() || matched.command_types.contains(command))
-        })
-        && view_matches(&requirement.views, matched.provenance))
-}
-
-/// Check the controller's resolved binding against the selected action and one
-/// negotiated device. Device and capability selection remain controller policy.
+/// Validate against the entire negotiated control. Use the scoped variant when
+/// application configuration restricts candidates further.
 pub fn validate_binding_resources(
     binding: &BindingMetadata,
     action: &ActionDescriptor,
     manager_id: &str,
     device: &ValidatedDevice,
 ) -> Result<()> {
-    binding.validate()?;
-    action.validate()?;
-    if binding.action_id != action.action_id {
-        return Err(unauthorized("binding names another action"));
-    }
-    let descriptor = device.descriptor();
-    device_matches(&binding.device_ref, manager_id, descriptor)?;
-    device_matches(&binding.control_ref.device_ref, manager_id, descriptor)?;
-    if !descriptor
-        .controls
-        .iter()
-        .any(|control| control.control_id == binding.control_ref.control_id)
-    {
-        return Err(unauthorized(
-            "binding control is absent from the negotiated descriptor",
-        ));
-    }
-    let requirements = action.requirements.as_deref().unwrap_or_default();
-    let mut resolved = Vec::new();
-    for matched in &binding.matched_capabilities {
-        let capability = resolve(&matched.capability, manager_id, descriptor)?;
-        if matched.family != capability.family
-            || matched.capability_type != capability.capability_type
-            || matched.direction != capability.direction
-            || !matched
-                .event_types
-                .iter()
-                .all(|event| capability.event_types.contains(event))
-            || !matched
-                .command_types
-                .iter()
-                .all(|command| capability.command_types.contains(command))
-        {
-            return Err(unauthorized(
-                "matched capability changes the negotiated capability's meaning",
-            ));
-        }
-        let provenance_ok = match (&capability.projection, matched.provenance) {
-            (None, CapabilityProvenance::Native | CapabilityProvenance::Extension) => true,
-            (Some(projection), CapabilityProvenance::Projection) => {
-                projection.projection_type == "projection"
-            }
-            (Some(projection), CapabilityProvenance::Derivation) => {
-                projection.projection_type == "derivation"
-            }
-            _ => false,
-        };
-        if !provenance_ok {
-            return Err(unauthorized(
-                "matched provenance differs from the negotiated descriptor",
-            ));
-        }
-        if let Some(source) = &matched.source {
-            resolve(source, manager_id, descriptor)?;
-            if capability.projection.as_ref().is_some_and(|projection| {
-                projection.source.control_id != source.control_id
-                    || projection.source.capability_id != source.capability_id
-            }) {
-                return Err(unauthorized(
-                    "matched projection source differs from its descriptor",
-                ));
-            }
-        }
-        if let Some(name) = &matched.requirement_name {
-            let requirement = requirements
-                .iter()
-                .find(|requirement| requirement.name == *name)
-                .ok_or_else(|| unauthorized("matched capability names an unknown requirement"))?;
-            if !satisfies(requirement, matched, capability)? {
-                return Err(unauthorized(
-                    "resolved capability does not satisfy its action requirement",
-                ));
-            }
-        } else if !requirements.is_empty()
-            && !requirements
-                .iter()
-                .map(|requirement| satisfies(requirement, matched, capability))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .any(|matches| matches)
-        {
-            return Err(unauthorized(
-                "resolved capability satisfies no action requirement",
-            ));
-        }
-        resolved.push((matched, capability));
-    }
-    for requirement in requirements
-        .iter()
-        .filter(|requirement| requirement.required)
-    {
-        if !resolved
-            .iter()
-            .map(|(matched, capability)| satisfies(requirement, matched, capability))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .any(|matches| matches)
-        {
-            return Err(unauthorized("required action capability is unresolved"));
-        }
-    }
-    Ok(())
+    device_matches(&binding.device_ref, manager_id, device.descriptor())?;
+    validate_binding_resources_scoped(
+        binding,
+        action,
+        &CapabilityMatchingScope {
+            device: device.descriptor(),
+            device_ref: &binding.device_ref,
+            control_id: &binding.control_ref.control_id,
+            configured_capability_ids: None,
+        },
+    )
 }
 
 /// Exact metadata comparison against controller-owned current state. The
@@ -372,16 +237,10 @@ pub fn validate_capability_input(
     let capability = resolve(&input.event.capability, manager_id, device.descriptor())?;
     let matched = bound_capability(&input.event.capability, current, |matched| {
         (matched.event_types.is_empty() || matched.event_types.contains(&input.event.event_type))
-            && input.event.view.is_none_or(|view| {
-                view_matches(&[view], matched.provenance)
-                    && action.requirements.as_deref().is_none_or(|requirements| {
-                        requirements.is_empty()
-                            || requirements.iter().any(|requirement| {
-                                (requirement.views.is_empty() || requirement.views.contains(&view))
-                                    && satisfies(requirement, matched, capability).unwrap_or(false)
-                            })
-                    })
-            })
+            && input
+                .event
+                .view
+                .is_none_or(|view| super::matching::view_matches(&view, capability))
             && input
                 .event
                 .source
@@ -402,7 +261,7 @@ pub fn validate_capability_input(
         if matched
             .source
             .as_ref()
-            .is_some_and(|expected| !same_capability(expected, source))
+            .is_none_or(|expected| !same_capability(expected, source))
         {
             return Err(unauthorized("input source differs from the matched source"));
         }
@@ -413,23 +272,6 @@ pub fn validate_capability_input(
             return Err(unauthorized(
                 "input source differs from the negotiated projection source",
             ));
-        }
-    }
-    if let Some(view) = input.event.view {
-        if !view_matches(&[view], matched.provenance) {
-            return Err(unauthorized(
-                "input view differs from the matched provenance",
-            ));
-        }
-        for requirement in action
-            .requirements
-            .iter()
-            .flatten()
-            .filter(|requirement| matched.requirement_name.as_ref() == Some(&requirement.name))
-        {
-            if !requirement.views.is_empty() && !requirement.views.contains(&view) {
-                return Err(unauthorized("input view is outside its action requirement"));
-            }
         }
     }
     let reference = &input.event.capability;

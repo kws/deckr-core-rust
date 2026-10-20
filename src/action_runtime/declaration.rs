@@ -97,12 +97,7 @@ pub fn validate_action_runtime_protocol(protocol: &ServiceProtocol) -> Result<()
             ServiceToConsumer,
             "replace-page-body",
         ),
-        (
-            "close_page",
-            Command,
-            ServiceToConsumer,
-            "empty-action-body",
-        ),
+        ("close_page", Command, ServiceToConsumer, "close-page-body"),
     ];
     if protocol.messages.len() != messages.len() || protocol.operations.len() != messages.len() {
         return Err(Error::Invalid(

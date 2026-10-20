@@ -22,6 +22,57 @@ use serde_json::{json, Value};
 mod action_boundary;
 
 #[test]
+fn action_runtime_semantic_vectors() {
+    use deckr::action_runtime::*;
+    use deckr::lanes::{DeviceDescriptor, DeviceRef};
+    let vectors: Value = artifact("vectors/action-runtime-semantics.v1.json");
+    for case in vectors["cases"].as_array().unwrap() {
+        let context = &vectors["contexts"][case["contextRef"].as_str().unwrap()];
+        let result = (|| -> deckr::Result<()> {
+            match case["rule"].as_str().unwrap() {
+                "SEM-ACT-002" => {
+                    let action = ActionDescriptor::from_value(context["actionDescriptor"].clone())?;
+                    let binding = BindingMetadata::from_value(case["instance"].clone())?;
+                    let device: DeviceDescriptor =
+                        serde_json::from_value(context["deviceDescriptor"].clone())?;
+                    let device_ref: DeviceRef =
+                        serde_json::from_value(context["deviceRef"].clone())?;
+                    let ids: Vec<String> =
+                        serde_json::from_value(context["configuredCapabilityIds"].clone())?;
+                    let scope = CapabilityMatchingScope {
+                        device: &device,
+                        device_ref: &device_ref,
+                        control_id: context["controlId"].as_str().unwrap(),
+                        configured_capability_ids: Some(&ids),
+                    };
+                    validate_binding_resources_scoped(&binding, &action, &scope)?;
+                    let mut generated = binding.clone();
+                    generated.matched_capabilities =
+                        match_capability_requirements(&action, &scope)?;
+                    validate_binding_resources_scoped(&generated, &action, &scope)
+                }
+                "SEM-ACT-003" => {
+                    let message = DeckrMessage::from_text(&case["instance"].to_string())?;
+                    let context = serde_json::from_value(context.clone())?;
+                    validate_page_command(&message, &context).map(|_| ())
+                }
+                "SEM-ACT-005" => ActionMessage::from_envelope(&DeckrMessage::from_text(
+                    &case["instance"].to_string(),
+                )?)
+                .map(|_| ()),
+                rule => panic!("unknown Action Runtime semantic rule {rule}"),
+            }
+        })();
+        assert_eq!(
+            result.is_ok(),
+            case["semanticValid"].as_bool().unwrap(),
+            "{}: {result:?}",
+            case["id"]
+        );
+    }
+}
+
+#[test]
 fn maintenance_records_match_upstream_examples() {
     use deckr::concord::{StaleObservationRecord, TokenCleanupRecord};
     for (directory, valid) in [("valid", true), ("invalid", false)] {

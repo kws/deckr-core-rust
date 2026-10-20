@@ -4,7 +4,7 @@ use crate::services::{
     ExchangePattern, ServiceIntent, ServiceMessageBody, ServiceMessageDirection,
 };
 use crate::{Error, Result};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Typed operations from the upstream Action Runtime v1 catalog. This is a
 /// payload representation, not a routing table or permission to allocate IDs.
@@ -23,7 +23,7 @@ pub enum ActionMessage {
     BindingOverlayClear(Box<BindingOverlayClear>),
     OpenPage(Box<DynamicPageBody>),
     ReplacePage(Box<DynamicPageBody>),
-    ClosePage,
+    ClosePage(Box<ClosePageBody>),
 }
 impl ActionMessage {
     pub fn name(&self) -> &'static str {
@@ -41,7 +41,7 @@ impl ActionMessage {
             Self::BindingOverlayClear(_) => "binding_overlay_clear",
             Self::OpenPage(_) => "open_page",
             Self::ReplacePage(_) => "replace_page",
-            Self::ClosePage => "close_page",
+            Self::ClosePage(_) => "close_page",
         }
     }
     pub fn direction(&self) -> ServiceMessageDirection {
@@ -63,7 +63,7 @@ impl ActionMessage {
             | Self::BindingOverlayClear(_)
             | Self::OpenPage(_)
             | Self::ReplacePage(_)
-            | Self::ClosePage => ServiceIntent::Command,
+            | Self::ClosePage(_) => ServiceIntent::Command,
             _ => ServiceIntent::Event,
         }
     }
@@ -80,8 +80,16 @@ impl ActionMessage {
             Self::BindingOutput(body) => body.to_value(),
             Self::BindingOverlay(body) => body.to_value(),
             Self::BindingOverlayClear(body) => body.to_value(),
-            Self::OpenPage(body) | Self::ReplacePage(body) => body.to_value(),
-            Self::ClosePage => Ok(Value::Object(Map::new())),
+            Self::OpenPage(body) => body.to_value(),
+            Self::ReplacePage(body) => {
+                if !matches!(body.target, PageCommandTarget::PageSession { .. }) {
+                    return Err(Error::Invalid(
+                        "replace_page requires a page-session target".into(),
+                    ));
+                }
+                body.to_value()
+            }
+            Self::ClosePage(body) => body.to_value(),
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -156,10 +164,7 @@ impl ActionMessage {
             }
             "open_page" => Self::OpenPage(Box::new(DynamicPageBody::from_value(payload)?)),
             "replace_page" => Self::ReplacePage(Box::new(DynamicPageBody::from_value(payload)?)),
-            "close_page" => {
-                EmptyActionBody::from_value(payload)?;
-                Self::ClosePage
-            }
+            "close_page" => Self::ClosePage(Box::new(ClosePageBody::from_value(payload)?)),
             _ => return Err(Error::Unsupported("unknown Action Runtime message".into())),
         };
         if action.intent() != body.intent {
@@ -167,6 +172,7 @@ impl ActionMessage {
                 "Action Runtime message has the wrong intent".into(),
             ));
         }
+        action.validate()?;
         Ok(action)
     }
     /// Validate the wire shape and endpoint roles. This does not establish
@@ -207,6 +213,17 @@ impl ActionMessage {
                 Error::Unauthorized("Action Runtime endpoint has the wrong service identity".into())
             })?;
         validate_provider_instance_id(instance)?;
+        let ids = &message.subject.identifiers;
+        if message.subject.kind != "service"
+            || ids.len() != 3
+            || ids.get("serviceId").map(String::as_str) != runtime.strip_prefix("service:")
+            || ids.get("namespace").map(String::as_str) != Some(ACTION_RUNTIME_NAMESPACE)
+            || ids.get("name").map(String::as_str) != Some(action.name())
+        {
+            return Err(Error::Invalid(
+                "Action Runtime subject must identify the service and operation".into(),
+            ));
+        }
         Ok(action)
     }
     /// Compare the payload's provider identity with a held runtime context.

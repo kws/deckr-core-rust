@@ -141,6 +141,14 @@ impl ActionModel for CapabilityRequirement {
         for selector in &self.preferences {
             selector.validate()?;
         }
+        if self
+            .views
+            .iter()
+            .enumerate()
+            .any(|(index, view)| self.views[..index].contains(view))
+        {
+            return Err(Error::Invalid("capability views must be unique".into()));
+        }
         tokens(&self.event_types)?;
         tokens(&self.command_types)
     }
@@ -170,7 +178,9 @@ impl ActionModel for MatchedCapability {
         family(&self.family)?;
         token(&self.capability_type)?;
         crate::lanes::validate_capability_direction(&self.direction)?;
-        optional_text(&self.requirement_name)?;
+        text(self.requirement_name.as_deref().ok_or_else(|| {
+            Error::Invalid("matched capability requires requirementName".into())
+        })?)?;
         tokens(&self.event_types)?;
         tokens(&self.command_types)?;
         if let Some(source) = &self.source {
@@ -449,6 +459,7 @@ pub struct PageSessionMetadata {
     pub context_id: String,
     pub page_id: String,
     pub page_session_id: String,
+    pub generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_binding_id: Option<String>,
     #[serde(default)]
@@ -811,10 +822,12 @@ impl ActionModel for DynamicPageCommand {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DynamicPageBody {
+    pub target: PageCommandTarget,
     pub descriptor: DynamicPageCommand,
 }
 impl ActionModel for DynamicPageBody {
     fn validate(&self) -> Result<()> {
+        self.target.validate()?;
         self.descriptor.validate()
     }
 }
@@ -992,5 +1005,49 @@ impl ActionModel for SettingsSnapshot {
         self.target.validate()?;
         self.schema_metadata.validate()?;
         crate::json::validate_numbers(&Value::Object(self.settings.clone()))
+    }
+}
+
+/// A target in the authorized controller session, with an independent generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum PageCommandTarget {
+    #[serde(rename = "binding")]
+    Binding {
+        #[serde(rename = "bindingId")]
+        binding_id: String,
+        generation: u64,
+    },
+    #[serde(rename = "page_session")]
+    PageSession {
+        #[serde(rename = "pageSessionId")]
+        page_session_id: String,
+        generation: u64,
+    },
+}
+impl ActionModel for PageCommandTarget {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Binding { binding_id, .. } => text(binding_id),
+            Self::PageSession {
+                page_session_id, ..
+            } => text(page_session_id),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosePageBody {
+    pub target: PageCommandTarget,
+}
+impl ActionModel for ClosePageBody {
+    fn validate(&self) -> Result<()> {
+        self.target.validate()?;
+        if !matches!(self.target, PageCommandTarget::PageSession { .. }) {
+            return Err(Error::Invalid(
+                "close_page requires a page-session target".into(),
+            ));
+        }
+        Ok(())
     }
 }

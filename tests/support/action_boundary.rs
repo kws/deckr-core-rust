@@ -128,7 +128,7 @@ impl ActionReferenceAuthority for References {
                     .collect::<Vec<_>>();
                 validate_page_children(&body.descriptor, &opener, &resolved)
             }
-            ActionMessage::ClosePage if self.page_ready.load(Ordering::SeqCst) => Ok(()),
+            ActionMessage::ClosePage(_) if self.page_ready.load(Ordering::SeqCst) => Ok(()),
             _ => Err(Error::Unauthorized(
                 "owner has no current resolution for this message".into(),
             )),

@@ -13,6 +13,10 @@ mod models;
 pub use models::*;
 mod messages;
 pub use messages::*;
+mod matching;
+pub use matching::*;
+mod pages;
+pub use pages::*;
 mod routing;
 pub use routing::*;
 mod availability;
@@ -98,6 +102,14 @@ fn family(value: &str) -> Result<()> {
     crate::lanes::validate_core_capability_family(value)
 }
 fn tokens(values: &[String]) -> Result<()> {
+    if values
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != values.len()
+    {
+        return Err(Error::Invalid("capability names must be unique".into()));
+    }
     for value in values {
         token(value)?;
     }

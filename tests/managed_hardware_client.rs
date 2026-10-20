@@ -246,7 +246,7 @@ impl Harness {
             HardwareManagerRuntimeSpec {
                 manager_id: "manager".into(),
                 session_id: "manager-session".into(),
-                labels: BTreeMap::new(),
+                labels: BTreeMap::from([("room".into(), "studio".into())]),
                 beacon_state: advertisements.clone(),
                 concord_contract_state: contracts,
                 concord_token_state: tokens,
@@ -328,6 +328,13 @@ async fn client_discovers_negotiates_validates_operations_and_delivers_scoped_ev
         .await
         .unwrap();
     assert_eq!(context.devices()["deck"].descriptor().fingerprint, "first");
+    let mut observed = h.client.state().value.candidates;
+    assert_eq!(observed[0].labels["room"], "studio");
+    observed[0].labels.insert("room".into(), "office".into());
+    assert_eq!(
+        h.client.state().value.candidates[0].labels["room"],
+        "studio"
+    );
     let terms = h
         .protocols
         .concord()
@@ -347,6 +354,19 @@ async fn client_discovers_negotiates_validates_operations_and_delivers_scoped_ev
         .await
         .unwrap();
     assert_eq!(reply.message_type, "commandReply");
+    let mut rejection = reply.clone();
+    rejection.message_type = "commandRejected".into();
+    rejection.body.as_object_mut().unwrap().remove("result");
+    rejection.body["reason"] = json!("rejected");
+    let mut stale = rejection.clone();
+    stale.sender_session_id = "old-session".into();
+    h.bus.publish(&stale, None, None).await.unwrap();
+    h.bus.publish(&rejection, None, None).await.unwrap();
+    let outcome = bounded(events.next()).await.unwrap().unwrap();
+    assert_eq!(outcome.message.message_type, "commandRejected");
+    assert_eq!(outcome.message.in_reply_to, reply.in_reply_to);
+    outcome.authorize().unwrap();
+    context.authorize().unwrap();
     assert_eq!(h.bus.routes(), 2);
     let mut invalid = command();
     if let HardwareMessageBody::ControlCommand { params, .. } = &mut invalid {

@@ -24,7 +24,7 @@ fn binding_value() -> Value {
     binding["outputGeneration"] = json!(4);
     binding["matchedCapabilities"] = json!([
         {"capability":capability("button"),"family":"dev.deckr.input.button","type":"activation","direction":"input","requirementName":"activate","eventTypes":["press"]},
-        {"capability":capability("lamp"),"family":"org.example.lamp","type":"brightness","direction":"output","requirementName":"light","commandTypes":["set"]}
+        {"capability":capability("lamp"),"family":"org.example.lamp","type":"brightness","direction":"output","requirementName":"light","commandTypes":["set"],"provenance":"extension"}
     ]);
     binding
 }
@@ -147,7 +147,8 @@ fn message_values() -> Vec<(&'static str, Value)> {
     page.as_object_mut().unwrap().remove("actionId");
     page["pageId"] = json!("page");
     page["pageSessionId"] = json!("page-session");
-    let dynamic = json!({"descriptor":{"pageId":"page","bindings":[{"controlId":"button-1","target":{"kind":"self"}}]}});
+    page["generation"] = json!(0);
+    let dynamic = json!({"target":{"kind":"page_session","pageSessionId":"page-session","generation":0},"descriptor":{"pageId":"page","bindings":[{"controlId":"button-1","target":{"kind":"self"}}]}});
     vec![
         ("action_instance_created", json!({"metadata":instance()})),
         ("action_instance_destroyed", json!({"metadata":instance()})),
@@ -180,7 +181,10 @@ fn message_values() -> Vec<(&'static str, Value)> {
         ),
         ("open_page", dynamic.clone()),
         ("replace_page", dynamic),
-        ("close_page", json!({})),
+        (
+            "close_page",
+            json!({"target":{"kind":"page_session","pageSessionId":"page-session","generation":0}}),
+        ),
     ]
 }
 fn wire_body(name: &str, payload: Value) -> ServiceMessageBody {
@@ -245,7 +249,7 @@ fn all_fourteen_messages_enforce_payload_positions_names_and_reply_exclusion() {
 #[test]
 fn action_envelopes_require_direct_controller_and_runtime_roles_and_target_sessions() {
     let body = wire_body("action_instance_created", json!({"metadata":instance()}));
-    let value = json!({"messageId":"m1","protocolVersion":"1","schemaVersion":"1","lane":"services","messageType":"serviceMessage","sender":"controller:main","senderSessionId":"controller-session","recipient":{"targetType":"endpoint","endpoint":"service:action-runtime.provider-1"},"recipientSessionId":"service-session","contract":{"contractId":"service-use","generation":1},"createdAt":"2026-01-01T00:00:00Z","subject":{"kind":"service"},"body":body.to_value().unwrap()});
+    let value = json!({"messageId":"m1","protocolVersion":"1","schemaVersion":"1","lane":"services","messageType":"serviceMessage","sender":"controller:main","senderSessionId":"controller-session","recipient":{"targetType":"endpoint","endpoint":"service:action-runtime.provider-1"},"recipientSessionId":"service-session","contract":{"contractId":"service-use","generation":1},"createdAt":"2026-01-01T00:00:00Z","subject":{"kind":"service","identifiers":{"serviceId":"action-runtime.provider-1","namespace":ACTION_RUNTIME_NAMESPACE,"name":"action_instance_created"}},"body":body.to_value().unwrap()});
     let message = DeckrMessage::from_text(&value.to_string()).unwrap();
     ActionMessage::from_envelope(&message).unwrap();
     let mut invalid = message.clone();
@@ -311,6 +315,9 @@ fn binding_resolution_checks_negotiated_resources_requirements_and_sources() {
     assert!(validate_binding_resources(&missing, &action, "manager", &device).is_err());
     let mut optional = action.clone();
     optional.requirements.as_mut().unwrap()[0].required = false;
+    assert!(validate_binding_resources(&missing, &optional, "manager", &device).is_err());
+    optional.requirements.as_mut().unwrap()[0].preferences[0].capability_type =
+        Some("momentary".into());
     validate_binding_resources(&missing, &optional, "manager", &device).unwrap();
     let mut mismatch = action;
     mismatch.requirements.as_mut().unwrap()[0].preferences[0].capability_type =
@@ -385,7 +392,7 @@ fn input_events_match_the_bound_capability_and_validate_its_payload() {
     input.event.view = Some(CapabilityView::Projected);
     assert!(validate_capability_input(&input, &current, &action, "manager", &device).is_err());
     input.event.view = Some(CapabilityView::Raw);
-    assert!(validate_capability_input(&input, &current, &action, "manager", &device).is_err());
+    validate_capability_input(&input, &current, &action, "manager", &device).unwrap();
     let mut anonymous = current.clone();
     anonymous.matched_capabilities[0].requirement_name = None;
     input.binding = anonymous.clone();
@@ -440,7 +447,7 @@ fn projected_sources_must_match_negotiated_provenance_even_when_metadata_omits_s
     current.matched_capabilities[0].capability.capability_id = "projected".into();
     current.matched_capabilities[0].provenance = CapabilityProvenance::Projection;
     current.matched_capabilities[0].source = Some(CapabilityRef {
-        device_ref: None,
+        device_ref: Some(serde_json::from_value(device_ref()).unwrap()),
         control_id: Some("button-1".into()),
         capability_id: "button".into(),
     });

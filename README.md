@@ -25,6 +25,33 @@ for reference artifacts and the
 [architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
 for informative component boundaries.
 
+## Action Runtime alpha.2 migration
+
+`action_runtime` implements the reviewed `1.0.0-alpha.2` page targets,
+page-session generations, and named capability matches. `DynamicPageBody`
+now carries a `PageCommandTarget`; `ActionMessage::ClosePage` carries
+`ClosePageBody`. Replacement and closure require a page-session target.
+`ActionMessage::from_envelope` requires the runtime service subject.
+
+`match_capability_requirements` and `validate_binding_resources_scoped` accept
+`CapabilityMatchingScope` observations for a negotiated device and control.
+They enforce preference order, required/optional matching, views, provenance,
+complete supported name sets, and exact projection sources. The existing
+`validate_binding_resources` uses the entire negotiated control; use the scoped
+variant when application configuration restricts candidates. No requirements
+means no matches, and every result needs `requirement_name`.
+
+`validate_page_command` checks a `PageCommandContext` and returns the retained
+target. The application supplies current observations and repeats the check
+while committing a serialized transition. The helper neither allocates pages
+nor acquires authority. The conformance target executes all upstream Action
+Runtime semantic cases through these public helpers.
+
+Hardware candidates already expose manager labels and managed events deliver
+authorized command rejections with correlation. `ServiceClientState.contract`
+now exposes the observed agreement identity. Operations still check current
+authority; retaining a state snapshot does not extend an agreement.
+
 ## Requirements
 
 - Rust 1.88 or newer, with Cargo, rustfmt, and Clippy.
@@ -434,9 +461,10 @@ Call its `authorize` again before an effect after awaiting other work.
 
 These handles share the managed service lifetime and never adopt a successor
 agreement. Reference failures and callback panics fail the operation without
-withdrawing otherwise healthy service authority. Page commands carry no opener
-ID in their payload: the owner resolves the current opener/page from its authorized
-scope and optional subject data, and rejects ambiguous commands. The controller
+withdrawing otherwise healthy service authority. Page commands carry an explicit
+binding or page-session target and generation in their payload. The owner resolves
+that retained target in its authorized scope and can use `validate_page_command`
+for ownership, current generation, and device-scope checks. The controller
 still sends hardware output separately through its current hardware claim.
 `validate_action_runtime_protocol` checks the host-supplied declaration against
 the core operation, direction, schema-reference and availability-family identities;
