@@ -10,8 +10,15 @@ for setup, crate usage, validation, and releases.
   Protocol changes belong there first; do not add local specification documents,
   schemas, catalogs, fixtures, or vector bundles.
 - Do not introduce Python or TypeScript source, tooling, or package metadata.
-- Keep controller orchestration, rendering policy, filesystem configuration, and
-  device-manager-specific behavior in the components that own them.
+- Keep controller orchestration, rendering, and configuration policy in application
+  repositories. Concrete drivers and device/backend/action behavior belong in the
+  components that own them.
+- Use the [project repository map](https://github.com/kws/deckr#project-repositories)
+  for ownership. Cross-language runners and test applications belong in
+  [deckr-integration-tests](https://github.com/kws/deckr-integration-tests);
+  Rust implementation fixes belong here.
+- Use repository URLs for cross-project documentation links. Keep implementation
+  coverage distinct from contract requirements, and date historical test evidence.
 
 ## Layout
 
@@ -28,19 +35,27 @@ behind the existing `nats` feature.
 
 ## Validation
 
+Run standalone checks first:
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
-cargo test --locked --all-features
+cargo test --locked --features nats
 cargo build --locked --all-features
-cargo doc --locked --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
-The conformance target requires `../deckr` or `DECKR_SPEC_DIR`. Its fixtures and
+Then run `cargo test --locked --all-features` with `../deckr` or
+`DECKR_SPEC_DIR` available. The conformance target's fixtures and
 vectors must be read from that checkout, never generated or copied into this
 repository. Run default-feature tests as well so ordinary development remains
 independent of a spec checkout and NATS.
+
+The live broker tests are ignored by default; follow the README to run them
+against a disposable broker. The native cross-language Concord runner uses
+`examples/interop.rs`. Coordinate specification and integration source pins using
+the README workflow.
 
 Use Cargo SemVer versions in the root manifest and follow the README release
 guidance. Specification versions and releases belong to the upstream repo.

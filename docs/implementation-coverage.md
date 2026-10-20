@@ -1,13 +1,19 @@
 # Architecture implementation coverage
 
 This maps the reusable Rust implementation to
-[the upstream informative architecture](../../deckr/docs/deckr-architecture.md).
-The reviewed upstream revision is `db0b84e968f6ec483b6f69547a37347dabaf4dce`,
-also pinned by `spec-revision`. The linked upstream specifications remain
+[the upstream informative architecture](https://github.com/kws/deckr/blob/db0b84e968f6ec483b6f69547a37347dabaf4dce/docs/deckr-architecture.md).
+The audit used upstream revision `db0b84e968f6ec483b6f69547a37347dabaf4dce`.
+See [spec-revision](../spec-revision) for the current CI pin. The upstream specifications remain
 authoritative. This file records implementation coverage and test evidence;
 it does not define wire contracts or certify every possible deployment.
 
 ## Validation checkpoint
+
+This section records the 2026-10-19 audit. It is not a result for each subsequent
+commit. Use the [README validation steps](../README.md#development) for the
+current checkout. Cross-language smoke, recovery, and native Concord evidence
+belongs in [deckr-integration-tests](https://github.com/kws/deckr-integration-tests);
+the checks below describe Rust implementation coverage.
 
 On 2026-10-19, all six repository validation commands passed on Rust 1.88.0,
 including the shared Concord index and compatibility fixes. Default-feature tests
@@ -16,8 +22,8 @@ target passed all twenty tests, including five managed Action Runtime boundary
 cases. Documentation built with warnings denied, and the crate packaged and
 verified offline with the uncommitted implementation included.
 
-All four opt-in NATS tests passed against a disposable localhost `nats:2.11`
-JetStream container. They cover reply inboxes, independent endpoint lifetimes,
+At that checkpoint, all four opt-in NATS tests passed against a disposable
+localhost `nats:2.11` JetStream container. They cover reply inboxes, independent endpoint lifetimes,
 shared view buckets, source recovery and closure, isolated maintenance, audited
 retained-record cleanup, and the three-host hardware/Action Runtime path. Cleanup
 checks found no remaining owned tokens, advertisements or KV consumers for that

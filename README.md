@@ -8,13 +8,30 @@ maintained in [kws/deckr](https://github.com/kws/deckr), normally checked out at
 `../deckr`. Protocol changes belong there first. This repository contains Rust
 implementation code and tests; it does not define or generate the specification.
 
+## Place in the project
+
+The [project repository map](https://github.com/kws/deckr#project-repositories)
+describes the reference, Python/Rust/TypeScript cores, and integration harness.
+This repository owns the Rust API and its implementation tests.
+Applications own controller routing, rendering, configuration policy, device
+drivers, and action or integration behavior.
+
+The cores use shared contracts with language-specific APIs and independent
+package versions and coverage.
+[deckr-integration-tests](https://github.com/kws/deckr-integration-tests)
+owns the real-broker cross-language workloads and their recorded evidence.
+Use the [schema guide](https://github.com/kws/deckr/blob/main/docs/schema-guide.md)
+for reference artifacts and the
+[architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
+for informative component boundaries.
+
 ## Requirements
 
 - Rust 1.88 or newer, with Cargo, rustfmt, and Clippy.
 - A checkout of `kws/deckr` for the optional conformance tests.
 - A JetStream-enabled NATS server when running an application with the `nats`
   feature. Ordinary tests do not require a running broker; the optional live
-  NATS regression test does.
+  NATS regression tests do.
 
 [mise](https://mise.jdx.dev/) users can install the configured toolchain with
 `mise install`.
@@ -249,10 +266,12 @@ unrelated contracts and token traffic cannot trigger more CAS attempts. Malforme
 JSON is retained as an invalid record observation rather than interrupting the
 shared source and revoking unrelated agreements.
 
-The `interop` example is a JSON-lines test driver for the external
-[`mixed-language` harness](../mixed-language/README.md), when the three language
-repositories are checked out as siblings. It exercises actual managed lifetimes
-and JetStream alongside the Python and TypeScript implementations.
+The `interop` example is a JSON-lines test driver for the
+[native Concord runner](https://github.com/kws/deckr-integration-tests#native-concord-lifecycle-test)
+in `deckr-integration-tests`, with the reference and three core repositories
+checked out as siblings. It exercises managed lifetimes and JetStream alongside
+Python and TypeScript. That harness also owns separate Compose smoke and recovery
+workloads using each core's public managed service APIs.
 
 Messaging validation does not grant application authority. Use
 `authority::AgreementMessageGuard` with `send_authorized`, `request_authorized`,
@@ -494,9 +513,9 @@ spec-revision          Upstream spec commit used by CI
 ```
 
 Keep reusable implementation here. Controller orchestration, rendering policy,
-controller configuration, and device-manager-specific behavior belong in the
-components that own them, such as
-[deckr-controller](https://github.com/kws/deckr-controller).
+layout persistence, and settings placement belong in application repositories
+such as [deckr-controller](https://github.com/kws/deckr-controller). Concrete
+drivers and device behavior belong in hardware-manager applications.
 
 ## Development
 
@@ -504,15 +523,17 @@ Run standalone checks from this repository's root:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets --features nats -- -D warnings
+cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo test --locked --features nats
-cargo build --locked --features nats
-cargo doc --locked --no-deps --features nats
+cargo build --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
 ```
 
 These commands need only this repository and its Cargo dependencies. The `nats`
-feature is compiled and tested without opening a broker connection.
+feature is compiled and tested without opening a broker connection. Compiling the
+`conformance` feature does not read upstream artifacts; running its tests does.
+These steps match the standalone CI job; CI also runs `cargo package --locked`.
 
 To exercise consumer cleanup, source recovery, optional maintenance and the
 three-host hardware/Action Runtime path against a disposable JetStream broker,
@@ -535,12 +556,13 @@ checkout. The variable names the repository root, which contains `contract/v1/`.
 Missing or invalid artifacts fail the tests with the path that could not be read.
 
 ```bash
-git clone https://github.com/kws/deckr.git ../deckr
-git -C ../deckr checkout "$(cat spec-revision)"
-cargo test --locked --all-features
+git clone https://github.com/kws/deckr.git .deckr-spec
+git -C .deckr-spec checkout --detach "$(cat spec-revision)"
+DECKR_SPEC_DIR="$PWD/.deckr-spec" cargo test --locked --all-features
 ```
 
-For an existing checkout elsewhere:
+This creates a separate ignored reference checkout without changing an existing
+sibling. For an existing checkout elsewhere:
 
 ```bash
 DECKR_SPEC_DIR=/path/to/deckr cargo test --locked --features conformance --test conformance
@@ -552,6 +574,11 @@ changes, update the commit in that file, and run the full checks against that
 checkout. The upstream commit must be available in `kws/deckr` before CI can fetch
 it. Passing the current test suite covers the implemented cases; it does not
 claim complete protocol conformance.
+
+When validating a coordinated contract or runtime change, update the source commits in
+`deckr-integration-tests/sources.lock.json` and follow its
+[source-pin workflow](https://github.com/kws/deckr-integration-tests#source-pins-and-coordinated-changes).
+All three core specification pins must agree with the harness's reference pin.
 
 ## Releases
 
