@@ -4,7 +4,7 @@ mod service_bus;
 use std::collections::BTreeSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -18,19 +18,69 @@ use deckr::runtime::ProtocolRuntime;
 use deckr::schema::SchemaRegistry;
 use deckr::services::*;
 use deckr::session::EndpointSession;
-use deckr::state::{MaterializedStateStore, MemoryStateStore, StateStore};
-use deckr::Result;
+use deckr::state::{
+    MaterializedStateStore, MemoryStateStore, StateEntry, StateSource, StateStore, StateWatchStream,
+};
+use deckr::{Error, Result};
 use futures_util::StreamExt;
-use serde_json::json;
+use serde_json::{json, Value};
 use service_bus::Bus;
 
-type Connection = ServiceConnection<MemoryStateStore, MemoryStateStore, Bus>;
-type Participant = ManagedParticipant<MemoryStateStore, MemoryStateStore>;
+#[derive(Debug, Clone)]
+struct TokenStore {
+    raw: MemoryStateStore,
+    fail_delete: Arc<Mutex<Option<String>>>,
+}
+impl StateStore for TokenStore {
+    async fn ttl_seconds(&self) -> Result<Option<u64>> {
+        self.raw.ttl_seconds().await
+    }
+    async fn get(&self, key: &str) -> Result<Option<StateEntry>> {
+        self.raw.get(key).await
+    }
+    async fn items(&self, prefix: &str) -> Result<Vec<StateEntry>> {
+        self.raw.items(prefix).await
+    }
+    async fn put(&self, key: &str, value: Value, ttl: Option<u64>) -> Result<StateEntry> {
+        self.raw.put(key, value, ttl).await
+    }
+    async fn create(&self, key: &str, value: Value, ttl: Option<u64>) -> Result<StateEntry> {
+        self.raw.create(key, value, ttl).await
+    }
+    async fn update(
+        &self,
+        key: &str,
+        value: Value,
+        revision: u64,
+        ttl: Option<u64>,
+    ) -> Result<StateEntry> {
+        self.raw.update(key, value, revision, ttl).await
+    }
+    async fn delete(&self, key: &str, revision: Option<u64>) -> Result<()> {
+        self.delete_revision(key, revision).await.map(|_| ())
+    }
+    async fn delete_revision(&self, key: &str, revision: Option<u64>) -> Result<u64> {
+        if self.fail_delete.lock().unwrap().as_deref() == Some(key) {
+            return Err(Error::StateUnavailable(
+                "injected token cleanup failure".into(),
+            ));
+        }
+        self.raw.delete_revision(key, revision).await
+    }
+    async fn watch(&self, prefix: &str) -> Result<StateWatchStream> {
+        self.raw.watch(prefix).await
+    }
+    async fn open_source(&self, prefix: &str) -> Result<StateSource> {
+        self.raw.open_source(prefix).await
+    }
+}
+type Connection = ServiceConnection<MemoryStateStore, TokenStore, Bus>;
+type Participant = ManagedParticipant<MemoryStateStore, TokenStore>;
 struct Harness {
-    runtime: ProtocolRuntime<MemoryStateStore, MemoryStateStore, MemoryStateStore>,
+    runtime: ProtocolRuntime<MemoryStateStore, MemoryStateStore, TokenStore>,
     advertisements: MemoryStateStore,
     contracts: MemoryStateStore,
-    tokens: MemoryStateStore,
+    tokens: TokenStore,
     directory: ServiceDirectory<MemoryStateStore>,
     protocol: ValidatedServiceProtocol,
     messages: MessageSession<Bus>,
@@ -40,7 +90,10 @@ impl Harness {
     async fn new() -> Self {
         let advertisements = MemoryStateStore::ttl_bound(300).unwrap();
         let contracts = MemoryStateStore::default();
-        let tokens = MemoryStateStore::ttl_bound(30).unwrap();
+        let tokens = TokenStore {
+            raw: MemoryStateStore::ttl_bound(30).unwrap(),
+            fail_delete: Arc::default(),
+        };
         let runtime =
             ProtocolRuntime::start(advertisements.clone(), contracts.clone(), tokens.clone())
                 .await
@@ -133,7 +186,7 @@ impl Harness {
             )
             .unwrap()
     }
-    fn spec(&self) -> ServiceClientSpec<MemoryStateStore, MemoryStateStore, MemoryStateStore, Bus> {
+    fn spec(&self) -> ServiceClientSpec<MemoryStateStore, MemoryStateStore, TokenStore, Bus> {
         ServiceClientSpec {
             directory: self.directory.clone(),
             protocol: self.protocol.clone(),
@@ -322,6 +375,59 @@ async fn later_candidates_join_pending_race_while_other_policy_work_is_blocked()
     client.close().await.unwrap();
     participant.close().await.unwrap();
     h.close().await;
+}
+
+#[tokio::test]
+async fn recovery_cleanup_is_diagnostic_but_shutdown_cleanup_still_fails() {
+    for fail_shutdown in [false, true] {
+        let h = Harness::new().await;
+        let (service, _) = h.advertise("first", "one", "ad-first").await;
+        let participant = h.participant(service);
+        let client = ServiceClient::start(h.spec()).unwrap();
+        let previous = bounded(client.wait_ready(None)).await.unwrap();
+        let old = previous.context().agreement().contract().clone();
+        let old_token = deckr::keys::concord_participant_token_key(
+            &old.contract_id,
+            old.generation,
+            h.messages.session().endpoint(),
+        );
+        *h.tokens.fail_delete.lock().unwrap() = Some(old_token);
+        previous.context().agreement().request_close();
+        until(|| client.state().value.cleanup_failures == 1).await;
+        until(|| {
+            client.connection().is_ok_and(|connection| {
+                connection.context().agreement().contract().contract_id != old.contract_id
+            })
+        })
+        .await;
+        let fresh = client.connection().unwrap();
+        assert!(previous.authorize().is_err());
+        assert!(client.state().value.last_cleanup_failure.is_some());
+        let mut command = body("write");
+        command.params.insert("value".into(), json!(5));
+        fresh.send(fresh.message(command).unwrap()).await.unwrap();
+        if fail_shutdown {
+            let current = fresh.context().agreement().contract();
+            *h.tokens.fail_delete.lock().unwrap() =
+                Some(deckr::keys::concord_participant_token_key(
+                    &current.contract_id,
+                    current.generation,
+                    h.messages.session().endpoint(),
+                ));
+        } else {
+            *h.tokens.fail_delete.lock().unwrap() = None;
+        }
+        assert_eq!(bounded(client.close()).await.is_err(), fail_shutdown);
+        assert_eq!(
+            client.state().value.cleanup_failures,
+            if fail_shutdown { 2 } else { 1 }
+        );
+        assert!(client.state().value.last_cleanup_failure.is_some());
+        assert!(fresh.authorize().is_err());
+        *h.tokens.fail_delete.lock().unwrap() = None;
+        participant.close().await.unwrap();
+        h.close().await;
+    }
 }
 
 #[tokio::test]

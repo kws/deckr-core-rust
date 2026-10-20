@@ -717,7 +717,7 @@ async fn close_runs_disconnect_and_shutdown_concurrently_and_keeps_borrowed_sour
 }
 
 #[tokio::test]
-async fn live_competing_provider_fails_bootstrap_before_publication_or_backend_dispatch() {
+async fn live_competing_provider_waits_until_ownership_clears_before_publication() {
     let h = Harness::new().await;
     let (provider, client, connection, messages) = h.pair().await;
     let other_messages =
@@ -726,9 +726,12 @@ async fn live_competing_provider_fails_bootstrap_before_publication_or_backend_d
     spec.messages = other_messages.clone();
     spec.advertisement.session_id = "competitor".into();
     let competitor = ServiceProvider::start(spec).unwrap();
-    bounded(competitor.wait_for(|state| state.phase == Phase::Closed, None))
+    bounded(competitor.wait_for(|state| state.phase == Phase::Unavailable, None))
         .await
         .unwrap();
+    // More than one retry must preserve the live owner's authority.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(competitor.state().phase, Phase::Unavailable);
     assert!(!competitor.state().value.bootstrapped);
     assert!(competitor.state().failure.is_some());
     assert_eq!(h.ads.items("").await.unwrap().len(), 1);
@@ -737,6 +740,46 @@ async fn live_competing_provider_fails_bootstrap_before_publication_or_backend_d
     client.close().await.unwrap();
     provider.close().await.unwrap();
     messages.close().await.unwrap();
+    bounded(competitor.wait_ready(None)).await.unwrap();
+    assert!(competitor.state().value.bootstrapped);
+    assert!(competitor.state().failure.is_none());
+    let (successor, successor_messages) = h.client("successor");
+    let next = bounded(successor.wait_ready(None)).await.unwrap();
+    assert_eq!(next.context().descriptor().session_id, "competitor");
+    assert_ne!(
+        next.context().agreement().contract().contract_id,
+        connection.context().agreement().contract().contract_id
+    );
+    assert!(connection.authorize().is_err());
+    successor.close().await.unwrap();
+    successor_messages.close().await.unwrap();
+    competitor.close().await.unwrap();
+    other_messages.close().await.unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn waiting_provider_close_stops_bootstrap_without_displacing_live_owner() {
+    let h = Harness::new().await;
+    let (provider, client, connection, messages) = h.pair().await;
+    let other_messages =
+        MessageSession::new(h.bus.clone(), session("service:provider", "competitor")).unwrap();
+    let mut spec = h.spec();
+    spec.messages = other_messages.clone();
+    spec.advertisement.session_id = "competitor".into();
+    let competitor = ServiceProvider::start(spec).unwrap();
+    bounded(competitor.wait_for(|state| state.phase == Phase::Unavailable, None))
+        .await
+        .unwrap();
+    bounded(competitor.close()).await.unwrap();
+    assert_eq!(competitor.state().phase, Phase::Closed);
+    assert!(!competitor.state().value.bootstrapped);
+    assert!(connection.authorize().is_ok());
+    client.close().await.unwrap();
+    provider.close().await.unwrap();
+    messages.close().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(h.ads.items("").await.unwrap().is_empty());
     other_messages.close().await.unwrap();
     h.close().await;
 }

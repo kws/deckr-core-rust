@@ -23,7 +23,9 @@ use crate::concord::{
 };
 use crate::endpoint::EndpointAddress;
 use crate::lanes::SERVICES_LANE;
-use crate::lifecycle::{Cancellation, Clock, Failure, Phase, Snapshot, StateCell, StateWatch};
+use crate::lifecycle::{
+    Cancellation, Clock, Failure, FailureKind, Phase, Snapshot, StateCell, StateWatch,
+};
 use crate::messaging::{
     Delivery, MessageAuthority, MessageSession, MessageSubscription, MessageTransport,
 };
@@ -113,6 +115,7 @@ pub struct ServiceBackendState {
 }
 #[derive(Debug, Clone)]
 pub struct ServiceProviderOptions {
+    /// Limit for each bootstrap attempt; unresolved ownership is retried.
     pub bootstrap_timeout: Duration,
     pub callback_timeout: Duration,
     pub max_connections: usize,
@@ -1260,6 +1263,56 @@ async fn publication_updates<C: StateStore, T: StateStore, M: MessageTransport>(
         }
     }
 }
+async fn bootstrap_provider<C: StateStore, T: StateStore, M: MessageTransport>(
+    shared: &Shared<C, T, M>,
+) -> Result<()> {
+    let mut retry_delay = Duration::from_millis(100);
+    loop {
+        let result = crate::lifecycle::deadline(
+            shared.clock.as_ref(),
+            shared.options.bootstrap_timeout,
+            "service provider bootstrap",
+            shared.concord.bootstrap(
+                shared.messages.session(),
+                Some(&shared.descriptor.use_profile),
+                true,
+            ),
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                shared.state.modify(|state| {
+                    state.failure = None;
+                    true
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                let failure = Failure::from_error("service provider bootstrap", &error);
+                if !matches!(
+                    failure.kind,
+                    FailureKind::Conflict | FailureKind::Unavailable | FailureKind::Deadline
+                ) {
+                    return Err(error);
+                }
+                shared.state.modify(|state| {
+                    state.phase = Phase::Unavailable;
+                    state.current = false;
+                    state.failure = Some(failure);
+                    true
+                });
+            }
+        }
+        // The supervisor cancels both attempts and waits on endpoint/provider
+        // closure. A new session never displaces live participation.
+        shared
+            .clock
+            .sleep_until(shared.clock.now() + retry_delay)
+            .await;
+        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+    }
+}
+
 async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransport>(
     shared: Arc<Shared<C, T, M>>,
     advertisements: B,
@@ -1273,17 +1326,7 @@ async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
             profile: Some(&shared.descriptor.use_profile),
             ..Default::default()
         })?;
-        crate::lifecycle::deadline(
-            shared.clock.as_ref(),
-            shared.options.bootstrap_timeout,
-            "service provider bootstrap",
-            shared.concord.bootstrap(
-                shared.messages.session(),
-                Some(&shared.descriptor.use_profile),
-                true,
-            ),
-        )
-        .await?;
+        bootstrap_provider(&shared).await?;
         let participant = {
             let mut owned = shared
                 .participant

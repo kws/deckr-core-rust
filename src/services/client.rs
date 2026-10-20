@@ -106,6 +106,8 @@ pub struct ServiceClientState {
     pub attempts: u64,
     pub rejected_messages: u64,
     pub received_messages: u64,
+    pub cleanup_failures: u64,
+    pub last_cleanup_failure: Option<Failure>,
 }
 pub struct ServiceClientSpec<B: StateStore, C: StateStore, T: StateStore, M: MessageTransport> {
     /// Borrowed host-owned index; clients do not create duplicate Beacon views.
@@ -434,7 +436,7 @@ async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
         shared.failure("service client", &error);
     }
     shared.close();
-    close_owned(&shared, None).await;
+    close_owned(&shared, None, true).await;
     *shared
         .selected
         .lock()
@@ -450,6 +452,7 @@ async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
 async fn close_owned<C: StateStore, T: StateStore, M: MessageTransport>(
     shared: &Shared<C, T, M>,
     keep: Option<&str>,
+    shutting_down: bool,
 ) {
     let owned: Vec<_> = shared
         .owned
@@ -484,11 +487,18 @@ async fn close_owned<C: StateStore, T: StateStore, M: MessageTransport>(
             .expect("service ownership lock poisoned")
             .remove(&key);
         if let Err(error) = result {
-            *shared
-                .cleanup_failure
-                .lock()
-                .expect("service cleanup lock poisoned") =
-                Some(Failure::from_error("service agreement cleanup", &error));
+            let failure = Failure::from_error("service agreement cleanup", &error);
+            shared.state.modify(|state| {
+                state.value.cleanup_failures = state.value.cleanup_failures.saturating_add(1);
+                state.value.last_cleanup_failure = Some(failure.clone());
+                true
+            });
+            if shutting_down || shared.stop.is_cancelled() {
+                *shared
+                    .cleanup_failure
+                    .lock()
+                    .expect("service cleanup lock poisoned") = Some(failure);
+            }
             shared.failure("service agreement cleanup", &error);
         }
     }
@@ -672,7 +682,7 @@ async fn race<B: StateStore, C: StateStore, T: StateStore, M: MessageTransport>(
                     Err(error)=>{agreement.request_close();shared.failure("service context",&error);continue;},
                 };
                 let connection=ServiceConnection::with_stop(context,shared.messages.clone(),shared.stop.clone())?;
-                close_owned(shared,Some(&agreement.contract().key)).await;
+                close_owned(shared,Some(&agreement.contract().key),false).await;
                 connection.authorize()?;
                 return Ok(connection);
             },
@@ -723,7 +733,7 @@ async fn negotiate<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
             Err(Error::Closed(reason)) => return Err(Error::Closed(reason)),
             Err(error) => shared.failure("service negotiation", &error),
         }
-        close_owned(shared, None).await;
+        close_owned(shared, None, false).await;
         let retry = shared
             .clock
             .now()

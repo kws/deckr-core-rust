@@ -346,6 +346,9 @@ winner, the client revokes all losers locally and joins their bounded cleanup.
 An accepted connection survives discovery withdrawal, replacement and closure.
 Authority loss publishes `ServiceClientStatus::Reconnecting` and starts a new
 race when discovery is available; commands are never replayed.
+Client state retains `cleanup_failures` and `last_cleanup_failure` after recovery.
+`close` reports failures from cleanup pending or started during shutdown; an
+earlier completed recovery failure does not fail a later successful shutdown.
 
 `wait_ready` returns an immutable `ServiceConnection`. Build an envelope with
 `message(body)`, add any owner-defined subject identifiers or trace fields, and
@@ -365,7 +368,9 @@ supplies the compiled declaration, immutable advertisement definition, borrowed
 Concord and messaging resources, advertisement store, admission policy and
 backend. Startup subscribes to the service lane, completes exclusive bootstrap,
 then starts participation and managed publication. A competing live provider
-session prevents publication. Backend status and diagnostics update discovery;
+session prevents publication. Startup retries unresolved ownership automatically;
+`bootstrap_timeout` limits each attempt. Closing the provider cancels this wait.
+Backend status and diagnostics update discovery;
 discovery failure or withdrawal leaves healthy agreements intact.
 
 `ServiceAdmissionPolicy` assesses a consumer endpoint/session and returns local

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -304,7 +304,7 @@ impl NatsDeckrRuntime {
             let event_epoch = connection_epoch.clone();
             // The callback also runs before the first dial. Initial retries are
             // owned here so dropping the connection future stops all attempts.
-            let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let connected = Arc::new(AtomicBool::new(false));
             let retry_connected = connected.clone();
             let maximum = config.reconnect_max_interval;
             let result = async_nats::ConnectOptions::new()
@@ -328,15 +328,7 @@ impl NatsDeckrRuntime {
                     let epoch = event_epoch.clone();
                     let connected = connected.clone();
                     async move {
-                        if matches!(event, async_nats::Event::Connected) {
-                            connected.store(true, Ordering::SeqCst);
-                        }
-                        if matches!(
-                            event,
-                            async_nats::Event::Disconnected | async_nats::Event::Connected
-                        ) {
-                            epoch.fetch_add(1, Ordering::SeqCst);
-                        }
+                        observe_connection_event(event, &connected, &epoch);
                     }
                 })
                 .connect(config.nats_url.as_str())
@@ -1361,9 +1353,41 @@ fn is_revision_conflict(error: &impl Display) -> bool {
         || message.contains("already exists")
 }
 
+fn observe_connection_event(event: async_nats::Event, connected: &AtomicBool, epoch: &AtomicU64) {
+    let interrupted = match event {
+        // The first callback can arrive after connect() returned. It establishes
+        // the connection; it must not invalidate snapshots already using it.
+        async_nats::Event::Connected => connected.swap(true, Ordering::SeqCst),
+        async_nats::Event::Disconnected => true,
+        _ => false,
+    };
+    if interrupted {
+        epoch.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_initial_connection_event_preserves_watch_continuity() {
+        let connected = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        // async-nats dispatches callbacks in a separate task. A snapshot can
+        // capture its epoch before the initial Connected callback runs.
+        let snapshot_epoch = epoch.load(Ordering::SeqCst);
+        observe_connection_event(async_nats::Event::Connected, &connected, &epoch);
+        assert!(connected.load(Ordering::SeqCst));
+        assert_eq!(epoch.load(Ordering::SeqCst), snapshot_epoch);
+
+        observe_connection_event(async_nats::Event::Disconnected, &connected, &epoch);
+        assert_ne!(epoch.load(Ordering::SeqCst), snapshot_epoch);
+        let disconnected_epoch = epoch.load(Ordering::SeqCst);
+        observe_connection_event(async_nats::Event::Connected, &connected, &epoch);
+        assert_ne!(epoch.load(Ordering::SeqCst), disconnected_epoch);
+        assert_ne!(epoch.load(Ordering::SeqCst), snapshot_epoch);
+    }
 
     #[test]
     fn reconnect_windows_are_bounded_and_reset_after_success() {
