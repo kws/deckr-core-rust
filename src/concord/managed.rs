@@ -137,18 +137,12 @@ impl<C: StateStore, T: StateStore>
                     }
                 }
                 ContractValidityStatus::Valid | ContractValidityStatus::NotYetFulfilled => {
-                    // A pending proposal or partial token is not proof of death.
+                    // A peer's session reference does not establish ownership.
+                    // A valid local participant token does, even while pending.
                     let competing = observed
                         .tokens
                         .get(session.endpoint().as_str())
-                        .is_some_and(|token| token.session_id != session.id())
-                        || observed
-                            .contract
-                            .as_ref()
-                            .and_then(|record| {
-                                record.participant_sessions.get(session.endpoint().as_str())
-                            })
-                            .is_some_and(|id| id != session.id());
+                        .is_some_and(|token| token.session_id != session.id());
                     if exclusive && competing {
                         return Err(Error::StateConflict(
                             "exclusive endpoint ownership is unresolved".into(),

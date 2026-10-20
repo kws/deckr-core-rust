@@ -445,6 +445,47 @@ async fn different_live_sessions_are_never_adopted_or_cancelled_by_bootstrap() {
 }
 
 #[tokio::test]
+async fn peer_session_references_do_not_block_bootstrap_but_pending_token_ownership_does() {
+    let (concord, contracts, _, _) = setup().await;
+    let client = session("client");
+    let provider = session("provider");
+    let other = session("pending");
+    let contender = EndpointSession::with_id(provider.endpoint().clone(), "new-provider").unwrap();
+    let mut spec = deckr::concord::CreateContractSpec::new(vec![
+        client.endpoint().clone(),
+        provider.endpoint().clone(),
+        other.endpoint().clone(),
+    ]);
+    spec.created_by = Some(client.endpoint().clone());
+    spec.participant_sessions
+        .insert(provider.endpoint().to_string(), provider.id().to_owned());
+    let pending = concord.create_contract(spec).await.unwrap();
+    concord
+        .attach(&pending, client.endpoint(), client.id(), None)
+        .await
+        .unwrap();
+    eventually(|| concord.contract_record_cached(&pending).unwrap().is_some()).await;
+    let before = contracts.raw.get(&pending.key).await.unwrap();
+    concord.bootstrap(&contender, None, true).await.unwrap();
+    assert_eq!(contracts.raw.get(&pending.key).await.unwrap(), before);
+    concord
+        .attach(&pending, provider.endpoint(), provider.id(), None)
+        .await
+        .unwrap();
+    let owned = contracts.raw.get(&pending.key).await.unwrap();
+    assert_eq!(
+        concord.validate(&pending, None).await.status,
+        ContractValidityStatus::NotYetFulfilled
+    );
+    assert!(matches!(
+        concord.bootstrap(&contender, None, true).await,
+        Err(Error::StateConflict(_))
+    ));
+    assert_eq!(contracts.raw.get(&pending.key).await.unwrap(), owned);
+    concord.close_sources_and_wait().await;
+}
+
+#[tokio::test]
 async fn cancelled_close_and_unknown_attachment_acknowledgements_keep_cleanup_owned() {
     let (concord, contracts, tokens, clock) = setup().await;
     let a = session("a");
