@@ -276,6 +276,17 @@ impl<C: StateStore, T: StateStore> ServiceContext<C, T> {
             ));
         }
         let body = message.service_body()?;
+        let identifiers = &message.subject.identifiers;
+        if message.subject.kind != "service"
+            || identifiers.get("serviceId") != Some(&self.0.descriptor.service_id)
+            || identifiers.get("namespace") != Some(&self.0.descriptor.namespace)
+            || identifiers.get("name") != Some(&body.name)
+        {
+            return Err(Error::Unauthorized(
+                "service subject must match the selected service, namespace and message name"
+                    .into(),
+            ));
+        }
         if !self
             .0
             .descriptor

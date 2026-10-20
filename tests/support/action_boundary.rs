@@ -412,7 +412,21 @@ async fn page_commands_require_owner_resolution_without_invented_wire_identity()
     assert!(h.action.accept(incoming.clone()).await.is_err());
     h.references.page_ready.store(true, Ordering::SeqCst);
     let accepted = h.action.accept(incoming).await.unwrap();
-    assert!(accepted.message().subject.identifiers.is_empty());
+    assert_eq!(
+        accepted.message().subject.identifiers,
+        [
+            (
+                "serviceId".into(),
+                provider.service().context().descriptor().service_id.clone()
+            ),
+            (
+                "namespace".into(),
+                "dev.deckr.action_runtime.provider".into()
+            ),
+            ("name".into(), "open_page".into()),
+        ]
+        .into()
+    );
     h.references.page_ready.store(false, Ordering::SeqCst);
     assert!(accepted.authorize().is_err());
     h.action.authorize().unwrap();

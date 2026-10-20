@@ -81,8 +81,9 @@ impl<C: StateStore, T: StateStore, M: MessageTransport> ServiceConnection<C, T, 
             _ => ServiceMessageDirection::ConsumerToService,
         }
     }
-    /// Builds the owned envelope. Owners may add declared subject identifiers,
-    /// trace data and expiry before calling `send` or `request`.
+    /// Builds the owned envelope with the service ID, namespace and message name
+    /// as subject identifiers. Owners may add application identifiers, trace data
+    /// and expiry before calling `send` or `request`.
     pub fn message(&self, body: ServiceMessageBody) -> Result<DeckrMessage> {
         self.authorize()?;
         let context = self.context();
@@ -113,7 +114,12 @@ impl<C: StateStore, T: StateStore, M: MessageTransport> ServiceConnection<C, T, 
             }),
             subject: EntitySubject {
                 kind: "service".into(),
-                identifiers: Default::default(),
+                identifiers: [
+                    ("serviceId".into(), context.descriptor().service_id.clone()),
+                    ("namespace".into(), context.descriptor().namespace.clone()),
+                    ("name".into(), body.name.clone()),
+                ]
+                .into(),
             },
             created_at: context.agreement().runtime_clock().utc_now().to_rfc3339(),
             expires_at: None,

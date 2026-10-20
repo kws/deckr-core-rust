@@ -312,6 +312,11 @@ async fn managed_boundaries_dispatch_both_directions_and_publish_protected_views
     let h = Harness::new().await;
     let (provider, client, connection, messages) = h.pair().await;
     let mut request = connection.message(body("read")).unwrap();
+    request
+        .subject
+        .identifiers
+        .insert("resourceId".into(), "lamp".into());
+    let subject = request.subject.clone();
     request.trace = Some(json!({"traceParent":"test-trace"}));
     let id = request.message_id.clone();
     let pointer = request.contract.clone();
@@ -319,6 +324,7 @@ async fn managed_boundaries_dispatch_both_directions_and_publish_protected_views
         .await
         .unwrap();
     assert_eq!(response.in_reply_to.as_ref(), Some(&id));
+    assert_eq!(response.subject, subject);
     assert_eq!(response.contract, pointer);
     assert_eq!(response.trace, Some(json!({"traceParent":"test-trace"})));
     assert_eq!(

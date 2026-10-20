@@ -182,7 +182,17 @@ impl Harness {
             }),
             subject: EntitySubject {
                 kind: "service".into(),
-                identifiers: Default::default(),
+                identifiers: BTreeMap::from([
+                    (
+                        "serviceId".into(),
+                        self.consumer.descriptor().service_id.clone(),
+                    ),
+                    (
+                        "namespace".into(),
+                        self.consumer.descriptor().namespace.clone(),
+                    ),
+                    ("name".into(), name.into()),
+                ]),
             },
             created_at: chrono::Utc::now().to_rfc3339(),
             expires_at: None,

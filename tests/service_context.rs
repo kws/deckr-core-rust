@@ -1,13 +1,100 @@
+#[path = "support/service_bus.rs"]
+mod service_bus;
 #[path = "support/service.rs"]
 mod service_support;
 
 use deckr::lanes::{DeckrMessage, MessageTarget};
-use deckr::messaging::MessageAuthority;
+use deckr::messaging::{MessageAuthority, MessageSession};
 use deckr::services::*;
 use deckr::state::StateStore;
 use deckr::{Error, Result};
 use serde_json::{json, Value};
 use service_support::{bounded, Harness};
+
+#[tokio::test]
+async fn service_connections_build_subject_identity_and_allow_application_identifiers() {
+    let h = Harness::new().await;
+    for (context, peer, from_service, name) in [
+        (&h.consumer, &h.service, false, "read"),
+        (&h.service, &h.consumer, true, "changed"),
+    ] {
+        let messages = MessageSession::new(
+            service_bus::Bus::default(),
+            context.agreement().session().clone(),
+        )
+        .unwrap();
+        let connection = ServiceConnection::new(context.clone(), messages.clone()).unwrap();
+        let mut message = connection
+            .message(h.message(name, from_service).service_body().unwrap())
+            .unwrap();
+        assert_eq!(message.subject.kind, "service");
+        assert_eq!(
+            message.subject.identifiers,
+            [
+                ("serviceId".into(), "test".into()),
+                ("namespace".into(), "org.example.test".into()),
+                ("name".into(), name.into()),
+            ]
+            .into()
+        );
+        message
+            .subject
+            .identifiers
+            .insert("resourceId".into(), "lamp".into());
+        context.validate_message(&message, true).await.unwrap();
+        peer.validate_message(&message, false).await.unwrap();
+        messages.close().await.unwrap();
+    }
+    h.close().await;
+}
+
+#[tokio::test]
+async fn service_context_rejects_missing_or_mismatched_subject_identity_in_both_directions() {
+    let h = Harness::new().await;
+    for (sender, recipient, message) in [
+        (&h.consumer, &h.service, h.message("read", false)),
+        (&h.service, &h.consumer, h.message("changed", true)),
+        (&h.service, &h.consumer, {
+            let mut reply = h.message("read", true);
+            reply.in_reply_to = Some("request".into());
+            reply.body["result"] = json!({"answer":42});
+            reply
+        }),
+    ] {
+        sender.validate_message(&message, true).await.unwrap();
+        recipient.validate_message(&message, false).await.unwrap();
+        let mut invalid = Vec::new();
+        for field in ["serviceId", "namespace", "name"] {
+            let mut missing = message.clone();
+            missing.subject.identifiers.remove(field);
+            invalid.push(missing);
+            let mut mismatched = message.clone();
+            mismatched
+                .subject
+                .identifiers
+                .insert(field.into(), "other".into());
+            invalid.push(mismatched);
+        }
+        let mut wrong_kind = message.clone();
+        wrong_kind.subject.kind = "application".into();
+        invalid.push(wrong_kind);
+        for message in invalid {
+            assert!(
+                sender.authorize_outgoing(&message).is_err(),
+                "{:?}",
+                message.subject
+            );
+            assert!(
+                recipient.authorize_incoming(&message).is_err(),
+                "{:?}",
+                message.subject
+            );
+            assert!(sender.validate_message(&message, true).await.is_err());
+            assert!(recipient.validate_message(&message, false).await.is_err());
+        }
+    }
+    h.close().await;
+}
 
 #[tokio::test]
 async fn service_context_checks_exact_peers_sessions_direction_and_operation_scope() {
