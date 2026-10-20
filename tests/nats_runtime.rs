@@ -250,6 +250,44 @@ async fn participation_does_not_require_maintenance_and_sources_recover_without_
         .unwrap();
     assert!(source.get_cached("records.created").unwrap().is_none());
 
+    let epoch = source.authority_epoch();
+    context
+        .publish(
+            format!("$KV.{}.records.invalid", config.concord_contract_bucket),
+            "{".into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while source.get_cached("records.invalid").unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(source
+        .get_cached("records.invalid")
+        .unwrap()
+        .unwrap()
+        .value
+        .is_null());
+    assert!(raw
+        .get("records.invalid")
+        .await
+        .unwrap()
+        .unwrap()
+        .value
+        .is_null());
+    assert_eq!(
+        source.authority_epoch(),
+        epoch,
+        "Malformed data must not interrupt unrelated authority"
+    );
+    assert_eq!(raw.items("records.").await.unwrap().len(), 2);
+    raw.delete("records.invalid", None).await.unwrap();
+
     let mut bucket = context
         .get_stream(format!("KV_{}", config.concord_contract_bucket))
         .await

@@ -18,6 +18,10 @@ conformance = []
 name = "conformance"
 required-features = ["conformance"]
 
+[[example]]
+name = "interop"
+required-features = ["nats"]
+
 [dependencies]
 async-nats = { version = "0.47", default-features = false, features = ["kv", "ring", "server_2_11"], optional = true }
 base64 = "0.22"

@@ -233,11 +233,26 @@ subject/header hints, including paired contract headers, against the envelope.
 The older `nats::EndpointSession` is a low-level compatibility helper; new managed
 components should use the neutral session with `MessageSession`.
 
-The host owns connection configuration, initial connection retries and final
-transport shutdown. The convenience runtime uses the NATS client's reconnect
-behavior and records every disconnect/reconnect epoch for source continuity.
+The host owns connection configuration and final transport shutdown.
+`DeckrRuntimeConfig::reconnect_max_interval` defaults to 60 seconds and
+`connection_timeout` to 5 seconds. Initial connection retries indefinitely with
+bounded dials and a fixed configured wait; dropping the startup future cancels
+those attempts. Established connections retry indefinitely with exponential
+windows, half-to-full-window jitter, and the configured cap. A successful
+connection resets the window. The runtime records every disconnect/reconnect
+epoch for source continuity.
 Recovery rebuilds sources but cannot restore terminated agreement authority.
 Close managed dependents, then shared sources, then release the transport.
+
+Attachment contention waits for the selected contract's revision to advance;
+unrelated contracts and token traffic cannot trigger more CAS attempts. Malformed
+JSON is retained as an invalid record observation rather than interrupting the
+shared source and revoking unrelated agreements.
+
+The `interop` example is a JSON-lines test driver for the external
+[`mixed-language` harness](../mixed-language/README.md), when the three language
+repositories are checked out as siblings. It exercises actual managed lifetimes
+and JetStream alongside the Python and TypeScript implementations.
 
 Messaging validation does not grant application authority. Use
 `authority::AgreementMessageGuard` with `send_authorized`, `request_authorized`,

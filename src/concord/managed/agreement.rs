@@ -600,10 +600,10 @@ async fn run_lifetime<C: StateStore, T: StateStore>(
         let started = clock.now();
         let attach = async {
             for attempt in 0..8 {
-                let before = (
-                    shared.concord.contract_state.snapshot().version,
-                    shared.concord.token_state.snapshot().version,
-                );
+                let before = shared
+                    .concord
+                    .raw_contract_cached(&shared.contract)?
+                    .map(|entry| entry.revision);
                 match shared
                     .concord
                     .attach_once(
@@ -616,10 +616,10 @@ async fn run_lifetime<C: StateStore, T: StateStore>(
                 {
                     Err(error) if is_state_revision_conflict(&error) && attempt < 7 => {
                         while before
-                            == (
-                                shared.concord.contract_state.snapshot().version,
-                                shared.concord.token_state.snapshot().version,
-                            )
+                            == shared
+                                .concord
+                                .raw_contract_cached(&shared.contract)?
+                                .map(|entry| entry.revision)
                         {
                             if !notifications.next().await {
                                 return Err(Error::Closed(

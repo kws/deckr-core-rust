@@ -33,6 +33,12 @@ use crate::state::{
 };
 use crate::{Error, Result};
 
+fn reconnect_delay(maximum: Duration, attempt: usize, sample: f64) -> Duration {
+    let cap = maximum.as_secs_f64();
+    let window = (cap.min(1.0) * 2_f64.powi(attempt.saturating_sub(1).min(64) as i32)).min(cap);
+    Duration::from_secs_f64(window * (0.5 + sample.clamp(0.0, 1.0) * 0.5))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeckrRuntimeConfig {
     pub nats_url: String,
@@ -40,6 +46,9 @@ pub struct DeckrRuntimeConfig {
     pub concord_contract_bucket: String,
     pub concord_token_bucket: String,
     pub concord_maintenance_bucket: String,
+    /// Maximum retry interval; also the fixed wait between initial attempts.
+    pub reconnect_max_interval: Duration,
+    pub connection_timeout: Duration,
 }
 
 impl DeckrRuntimeConfig {
@@ -50,6 +59,8 @@ impl DeckrRuntimeConfig {
             concord_contract_bucket: DEFAULT_CONCORD_CONTRACT_STORE_NAME.to_string(),
             concord_token_bucket: DEFAULT_CONCORD_TOKEN_STORE_NAME.to_string(),
             concord_maintenance_bucket: DEFAULT_CONCORD_MAINTENANCE_STORE_NAME.to_string(),
+            reconnect_max_interval: Duration::from_secs(60),
+            connection_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -277,30 +288,67 @@ impl NatsDeckrRuntime {
             concord_contract_bucket: concord_contract_bucket.to_string(),
             concord_token_bucket: concord_token_bucket.to_string(),
             concord_maintenance_bucket: DEFAULT_CONCORD_MAINTENANCE_STORE_NAME.to_string(),
+            ..DeckrRuntimeConfig::new(url)
         })
         .await
     }
 
     pub async fn connect_with_config(config: DeckrRuntimeConfig) -> Result<Self> {
+        if config.reconnect_max_interval.is_zero() || config.connection_timeout.is_zero() {
+            return Err(Error::Invalid(
+                "NATS retry interval and dial timeout must be positive".into(),
+            ));
+        }
         let connection_epoch = Arc::new(AtomicU64::new(0));
-        let event_epoch = connection_epoch.clone();
-        let client = async_nats::ConnectOptions::new()
-            .event_callback(move |event| {
-                let epoch = event_epoch.clone();
-                async move {
-                    if matches!(
-                        event,
-                        async_nats::Event::Disconnected | async_nats::Event::Connected
-                    ) {
-                        epoch.fetch_add(1, Ordering::SeqCst);
+        let client = loop {
+            let event_epoch = connection_epoch.clone();
+            // The callback also runs before the first dial. Initial retries are
+            // owned here so dropping the connection future stops all attempts.
+            let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let retry_connected = connected.clone();
+            let maximum = config.reconnect_max_interval;
+            let result = async_nats::ConnectOptions::new()
+                .connection_timeout(config.connection_timeout)
+                .max_reconnects(None)
+                .reconnect_delay_callback(move |attempt| {
+                    if !retry_connected.load(Ordering::SeqCst) {
+                        return if attempt <= 1 {
+                            Duration::ZERO
+                        } else {
+                            maximum
+                        };
                     }
+                    // UUID randomness is already available and independent per dial.
+                    // UUID's top two bits in this half are fixed variant bits.
+                    let random_bits = Uuid::new_v4().as_u128() as u64 & ((1_u64 << 62) - 1);
+                    let sample = random_bits as f64 / ((1_u64 << 62) - 1) as f64;
+                    reconnect_delay(maximum, attempt, sample)
+                })
+                .event_callback(move |event| {
+                    let epoch = event_epoch.clone();
+                    let connected = connected.clone();
+                    async move {
+                        if matches!(event, async_nats::Event::Connected) {
+                            connected.store(true, Ordering::SeqCst);
+                        }
+                        if matches!(
+                            event,
+                            async_nats::Event::Disconnected | async_nats::Event::Connected
+                        ) {
+                            epoch.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+                .connect(config.nats_url.as_str())
+                .await;
+            match result {
+                Ok(client) => break client,
+                Err(error) if error.kind() == async_nats::ConnectErrorKind::ServerParse => {
+                    return Err(Error::Invalid(format!("NATS server address: {error}")));
                 }
-            })
-            .connect(config.nats_url.as_str())
-            .await
-            .map_err(|error| {
-                Error::StateUnavailable(format!("connecting to NATS {}: {error}", config.nats_url))
-            })?;
+                Err(_) => tokio::time::sleep(config.reconnect_max_interval).await,
+            }
+        };
         let jetstream = async_nats::jetstream::new(client.clone());
         let beacon_advertisements = open_state_bucket(
             &jetstream,
@@ -942,7 +990,10 @@ impl NatsSourceWatch {
         let entry = if operation == StateOperation::Put {
             Some(StateEntry {
                 key: key.clone(),
-                value: crate::json::parse(&message.payload)?,
+                // Invalid bytes remain an observed record. Null cannot parse as
+                // a protocol record, but must not turn into a missing key or a
+                // transport discontinuity that revokes unrelated agreements.
+                value: crate::json::parse(&message.payload).unwrap_or(Value::Null),
                 revision,
             })
         } else {
@@ -1006,7 +1057,7 @@ impl StateStore for NatsStateStore {
         }
         Ok(Some(StateEntry {
             key: key.to_string(),
-            value: crate::json::parse(&entry.value)?,
+            value: crate::json::parse(&entry.value).unwrap_or(Value::Null),
             revision: entry.revision,
         }))
     }
@@ -1313,6 +1364,45 @@ fn is_revision_conflict(error: &impl Display) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_windows_are_bounded_and_reset_after_success() {
+        for cap in [0.25, 5.0, 60.0] {
+            let maximum = Duration::from_secs_f64(cap);
+            for attempt in 1..140 {
+                let window = (cap.min(1.0) * 2_f64.powi((attempt - 1).min(64) as i32)).min(cap);
+                assert_eq!(
+                    reconnect_delay(maximum, attempt, 0.0),
+                    Duration::from_secs_f64(window / 2.0)
+                );
+                assert_eq!(
+                    reconnect_delay(maximum, attempt, 1.0),
+                    Duration::from_secs_f64(window)
+                );
+            }
+            assert_eq!(
+                reconnect_delay(maximum, 1, 1.0),
+                Duration::from_secs_f64(cap.min(1.0))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_connection_waits_until_cancelled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = DeckrRuntimeConfig::new(format!("nats://{address}"));
+        config.reconnect_max_interval = Duration::from_millis(5);
+        config.connection_timeout = Duration::from_millis(5);
+        // Several refused dials must not end startup; dropping it cancels retries.
+        assert!(tokio::time::timeout(
+            Duration::from_millis(40),
+            NatsDeckrRuntime::connect_with_config(config)
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn lane_and_inbox_decoding_reject_conflicting_or_partial_hints() {

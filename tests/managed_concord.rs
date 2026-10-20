@@ -166,6 +166,7 @@ struct FaultStore {
     scans: Arc<AtomicUsize>,
     attachment_conflicts: Arc<AtomicUsize>,
     attachment_attempts: Arc<AtomicUsize>,
+    conflict_unrelated: Arc<AtomicBool>,
     fail_updates: Arc<AtomicBool>,
     panic_updates: Arc<AtomicBool>,
     panic_key: Arc<Mutex<Option<String>>>,
@@ -183,6 +184,7 @@ impl FaultStore {
             scans: Arc::default(),
             attachment_conflicts: Arc::default(),
             attachment_attempts: Arc::default(),
+            conflict_unrelated: Arc::default(),
             fail_updates: Arc::default(),
             panic_updates: Arc::default(),
             panic_key: Arc::default(),
@@ -239,10 +241,20 @@ impl StateStore for FaultStore {
                 })
                 .is_ok()
             {
-                let current = self.raw.get(key).await?.unwrap();
-                self.raw
-                    .update(key, current.value, current.revision, ttl)
-                    .await?;
+                if self.conflict_unrelated.load(Ordering::SeqCst) {
+                    self.raw
+                        .put(
+                            "contracts.unrelated.1.meta",
+                            serde_json::json!({"noise": true}),
+                            None,
+                        )
+                        .await?;
+                } else {
+                    let current = self.raw.get(key).await?.unwrap();
+                    self.raw
+                        .update(key, current.value, current.revision, ttl)
+                        .await?;
+                }
                 return Err(Error::mutation(
                     deckr::MutationCode::RevisionChanged,
                     "injected CAS conflict",
@@ -729,5 +741,26 @@ async fn malformed_existing_ownership_blocks_bootstrap_without_mutation() {
             .value,
         value
     );
+    concord.close_sources_and_wait().await;
+}
+
+#[tokio::test]
+async fn attachment_conflicts_wait_for_the_selected_contract() {
+    let (concord, contracts, _, clock) = setup().await;
+    contracts.attachment_conflicts.store(20, Ordering::SeqCst);
+    contracts.conflict_unrelated.store(true, Ordering::SeqCst);
+    let a = session("filtered-retry");
+    let proposal = concord
+        .propose(a.clone(), AgreementIntent::new(vec![a.endpoint().clone()]))
+        .unwrap();
+    eventually(|| contracts.attachment_attempts.load(Ordering::SeqCst) >= 1).await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(contracts.attachment_attempts.load(Ordering::SeqCst), 1);
+    clock.advance(Duration::from_secs(5));
+    eventually(|| proposal.state().phase == Phase::Terminal).await;
+    assert!(!proposal.has_authority());
+    bounded(proposal.close()).await.unwrap();
     concord.close_sources_and_wait().await;
 }
