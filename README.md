@@ -25,11 +25,12 @@ for reference artifacts and the
 [architecture proposal](https://github.com/kws/deckr/blob/main/docs/deckr-architecture.md)
 for informative component boundaries.
 
-## Action Runtime alpha.2 migration
+## Action Runtime contract support
 
-`action_runtime` implements the reviewed `1.0.0-alpha.2` page targets,
-page-session generations, and named capability matches. `DynamicPageBody`
-now carries a `PageCommandTarget`; `ActionMessage::ClosePage` carries
+`action_runtime` implements page targets, page-session generations, and named
+capability matches from the alpha contract at the Git revision in
+[spec-revision](spec-revision). `DynamicPageBody`
+carries a `PageCommandTarget`; `ActionMessage::ClosePage` carries
 `ClosePageBody`. Replacement and closure require a page-session target.
 `ActionMessage::from_envelope` requires the runtime service subject.
 
@@ -40,6 +41,13 @@ complete supported name sets, and exact projection sources. The existing
 `validate_binding_resources` uses the entire negotiated control; use the scoped
 variant when application configuration restricts candidates. No requirements
 means no matches, and every result needs `requirement_name`.
+
+Pass the same configured capability IDs to `validate_binding_output_scoped`
+and `validate_capability_input_scoped` when checking later messages. This keeps
+preference selection within the configured scope. Their unscoped counterparts
+use the entire negotiated control. `None` means unrestricted; an empty slice
+permits no capabilities. Both variants retain identity, generation, and payload
+checks, and sending output still needs a current hardware claim.
 
 `validate_page_command` checks a `PageCommandContext` and returns the retained
 target. The application supplies current observations and repeats the check

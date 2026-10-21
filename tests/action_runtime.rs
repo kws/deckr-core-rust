@@ -379,6 +379,97 @@ fn outputs_and_overlays_require_current_binding_generations_and_valid_hardware_p
     new_binding.output_generation = 5;
     assert!(validate_binding_reference(&current, &new_binding).is_err());
 }
+
+#[test]
+fn input_and_output_preserve_configured_capability_preferences() {
+    let mut descriptor = device().descriptor().clone();
+    let control = &mut descriptor.controls[0];
+    let mut preferred_button = control.input_capabilities[0].clone();
+    preferred_button.capability_id = "preferred-button".into();
+    control.input_capabilities.push(preferred_button);
+    let mut preferred_lamp = control.output_capabilities[0].clone();
+    preferred_lamp.capability_id = "preferred-lamp".into();
+    control.output_capabilities.push(preferred_lamp);
+    let device = ValidatedDevice::new(descriptor, &SchemaRegistry::default()).unwrap();
+    let mut action = action();
+    for (requirement, preferred_id) in action
+        .requirements
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .zip(["preferred-button", "preferred-lamp"])
+    {
+        let mut preferred = requirement.preferences[0].clone();
+        preferred.capability_id = Some(preferred_id.into());
+        requirement.preferences.insert(0, preferred);
+    }
+    let current = binding();
+    let ids = ["button".into(), "lamp".into()];
+    let scope = CapabilityMatchingScope {
+        device: device.descriptor(),
+        device_ref: &current.device_ref,
+        control_id: &current.control_ref.control_id,
+        configured_capability_ids: Some(&ids),
+    };
+    assert_eq!(
+        match_capability_requirements(&action, &scope).unwrap(),
+        current.matched_capabilities
+    );
+    validate_binding_resources_scoped(&current, &action, &scope).unwrap();
+    let input = CapabilityInput::from_value(json!({
+        "binding": binding_value(),
+        "event": {
+            "capability": capability("button"), "eventType": "press",
+            "occurredAt": "2026-01-01T00:00:00Z", "view": "native",
+            "value": {"eventType": "press"}
+        }
+    }))
+    .unwrap();
+    let output = output();
+    let check_input = |input: &CapabilityInput, ids: Option<&[String]>| {
+        validate_capability_input_scoped(input, &current, &action, "manager", &device, ids)
+    };
+    let check_output = |output: &BindingOutput, ids: Option<&[String]>| {
+        validate_binding_output_scoped(output, &current, &action, "manager", &device, ids)
+    };
+    check_input(&input, Some(&ids)).unwrap();
+    assert!(matches!(
+        check_output(&output, Some(&ids)).unwrap(),
+        HardwareMessageBody::ControlCommand { .. }
+    ));
+    assert!(validate_capability_input(&input, &current, &action, "manager", &device).is_err());
+    assert!(validate_binding_output(&output, &current, &action, "manager", &device).is_err());
+    for disallowed in [
+        None,
+        Some([].as_slice()),
+        Some(["missing".into()].as_slice()),
+    ] {
+        assert!(check_input(&input, disallowed).is_err());
+        assert!(check_output(&output, disallowed).is_err());
+    }
+    let mut invalid_input = input.clone();
+    invalid_input.event.value = Some(json!({"eventType": "wrong"}));
+    assert!(check_input(&invalid_input, Some(&ids)).is_err());
+    let mut invalid_output = output.clone();
+    invalid_output.generation = 3;
+    assert!(check_output(&invalid_output, Some(&ids)).is_err());
+    invalid_output = output.clone();
+    invalid_output.params.insert("level".into(), json!(100));
+    assert!(check_output(&invalid_output, Some(&ids)).is_err());
+    invalid_output = output.clone();
+    invalid_output.capability.capability_id = "preferred-lamp".into();
+    assert!(check_output(&invalid_output, Some(&ids)).is_err());
+    assert!(validate_binding_output_scoped(
+        &output,
+        &current,
+        &action,
+        "other-manager",
+        &device,
+        Some(&ids)
+    )
+    .is_err());
+}
+
 #[test]
 fn input_events_match_the_bound_capability_and_validate_its_payload() {
     let current = binding();

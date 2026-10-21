@@ -86,6 +86,15 @@ pub fn validate_binding_resources(
     manager_id: &str,
     device: &ValidatedDevice,
 ) -> Result<()> {
+    validate_binding_resources_with_capabilities(binding, action, manager_id, device, None)
+}
+fn validate_binding_resources_with_capabilities(
+    binding: &BindingMetadata,
+    action: &ActionDescriptor,
+    manager_id: &str,
+    device: &ValidatedDevice,
+    configured_capability_ids: Option<&[String]>,
+) -> Result<()> {
     device_matches(&binding.device_ref, manager_id, device.descriptor())?;
     validate_binding_resources_scoped(
         binding,
@@ -94,7 +103,7 @@ pub fn validate_binding_resources(
             device: device.descriptor(),
             device_ref: &binding.device_ref,
             control_id: &binding.control_ref.control_id,
-            configured_capability_ids: None,
+            configured_capability_ids,
         },
     )
 }
@@ -190,10 +199,29 @@ pub fn validate_binding_output(
     manager_id: &str,
     device: &ValidatedDevice,
 ) -> Result<HardwareMessageBody> {
+    validate_binding_output_scoped(output, current, action, manager_id, device, None)
+}
+/// Validate output using the same configured capability IDs used to match the
+/// binding. `None` uses the entire negotiated control; an empty slice allows none.
+/// Sending the returned body still requires a current hardware claim.
+pub fn validate_binding_output_scoped(
+    output: &BindingOutput,
+    current: &BindingMetadata,
+    action: &ActionDescriptor,
+    manager_id: &str,
+    device: &ValidatedDevice,
+    configured_capability_ids: Option<&[String]>,
+) -> Result<HardwareMessageBody> {
     output.validate()?;
     validate_binding_reference(&output.binding, current)?;
     generation(output.generation, current)?;
-    validate_binding_resources(current, action, manager_id, device)?;
+    validate_binding_resources_with_capabilities(
+        current,
+        action,
+        manager_id,
+        device,
+        configured_capability_ids,
+    )?;
     bound_capability(&output.capability, current, |matched| {
         matched.command_types.is_empty() || matched.command_types.contains(&output.command_type)
     })?;
@@ -231,9 +259,27 @@ pub fn validate_capability_input(
     manager_id: &str,
     device: &ValidatedDevice,
 ) -> Result<()> {
+    validate_capability_input_scoped(input, current, action, manager_id, device, None)
+}
+/// Validate input using the same configured capability IDs used to match the
+/// binding. `None` uses the entire negotiated control; an empty slice allows none.
+pub fn validate_capability_input_scoped(
+    input: &CapabilityInput,
+    current: &BindingMetadata,
+    action: &ActionDescriptor,
+    manager_id: &str,
+    device: &ValidatedDevice,
+    configured_capability_ids: Option<&[String]>,
+) -> Result<()> {
     input.validate()?;
     validate_binding_reference(&input.binding, current)?;
-    validate_binding_resources(current, action, manager_id, device)?;
+    validate_binding_resources_with_capabilities(
+        current,
+        action,
+        manager_id,
+        device,
+        configured_capability_ids,
+    )?;
     let capability = resolve(&input.event.capability, manager_id, device.descriptor())?;
     let matched = bound_capability(&input.event.capability, current, |matched| {
         (matched.event_types.is_empty() || matched.event_types.contains(&input.event.event_type))
