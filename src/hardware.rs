@@ -9,6 +9,7 @@ use crate::profiles::hardware::{
 };
 use crate::Result;
 
+pub mod capabilities;
 pub mod client;
 pub mod validation;
 
@@ -340,38 +341,24 @@ pub mod runtime {
     }
 
     pub trait HardwareCommandHandler: Send + Sync + 'static {
-        /// Compatibility callback for immediate driver operations.
+        /// Retain the context across asynchronous or queued work and authorize
+        /// again immediately before device I/O. Revoked contexts never recover.
         fn handle_hardware_command<'a>(
             &'a self,
-            _message: DeckrMessage,
-        ) -> HardwareCommandFuture<'a> {
-            Box::pin(async { Ok(HardwareCommandOutcome::Unsupported) })
-        }
-
-        /// Override this for asynchronous driver work. The context permanently
-        /// loses authority when its agreement ends or the device is replaced.
-        fn handle_authorized_hardware_command<'a>(
-            &'a self,
             context: HardwareCommandContext,
-        ) -> HardwareCommandFuture<'a> {
-            Box::pin(async move {
-                context.authorize()?;
-                self.handle_hardware_command(context.message().clone())
-                    .await
-            })
-        }
+        ) -> HardwareCommandFuture<'a>;
     }
 
     impl<F, Fut> HardwareCommandHandler for F
     where
-        F: Fn(DeckrMessage) -> Fut + Send + Sync + 'static,
+        F: Fn(HardwareCommandContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<HardwareCommandOutcome>> + Send + 'static,
     {
         fn handle_hardware_command<'a>(
             &'a self,
-            message: DeckrMessage,
+            context: HardwareCommandContext,
         ) -> HardwareCommandFuture<'a> {
-            Box::pin((self)(message))
+            Box::pin((self)(context))
         }
     }
 
@@ -1809,7 +1796,7 @@ pub mod runtime {
                         reply,
                     };
                     let outcome = handler
-                        .handle_authorized_hardware_command(driver_context.clone())
+                        .handle_hardware_command(driver_context.clone())
                         .await?;
                     driver_context.authorize()?;
                     self.publish_command_outcome(&delivery, outcome).await

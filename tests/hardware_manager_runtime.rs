@@ -151,7 +151,7 @@ impl RecordingCommandHandler {
 }
 
 impl HardwareCommandHandler for RecordingCommandHandler {
-    fn handle_authorized_hardware_command<'a>(
+    fn handle_hardware_command<'a>(
         &'a self,
         context: HardwareCommandContext,
     ) -> HardwareCommandFuture<'a> {
@@ -159,11 +159,6 @@ impl HardwareCommandHandler for RecordingCommandHandler {
             context.authorize()?;
             let message = context.message().clone();
             self.contexts.lock().await.push(context);
-            self.handle_hardware_command(message).await
-        })
-    }
-    fn handle_hardware_command<'a>(&'a self, message: DeckrMessage) -> HardwareCommandFuture<'a> {
-        Box::pin(async move {
             self.messages.lock().await.push(message);
             Ok(self
                 .outcomes
@@ -599,7 +594,7 @@ async fn manager_renews_from_ttl_while_a_driver_callback_is_blocked() {
     let lane = MemoryHardwareLane::default();
     let driver_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let entered = driver_entered.clone();
-    let handler = Arc::new(move |_message: DeckrMessage| {
+    let handler = Arc::new(move |_context: HardwareCommandContext| {
         let entered = entered.clone();
         async move {
             entered.store(true, std::sync::atomic::Ordering::SeqCst);

@@ -173,7 +173,7 @@ constraints, and core raster image bytes and dimensions. Numeric step and scaled
 range checks retain decimal precision; exponent expansion is limited to 10,000
 places. The manager performs schema and image work off the async scheduler and
 checks current authority again before dispatch. Drivers doing asynchronous work
-can override `handle_authorized_hardware_command` and call the supplied
+implement `handle_hardware_command` and call the supplied
 `HardwareCommandContext::authorize` after waits. Its descriptor and agreement
 stay fixed; device replacement or claim termination invalidates that context.
 
@@ -189,6 +189,11 @@ override the delivery/reply methods to support inbox routes.
 `schema::SchemaRegistry` compiles embedded JSON Schemas without automatic file
 or network retrieval. Supply referenced resources with `with_resource`, then
 use `HardwareManagerRuntime::new_with_schemas` or `with_concord_and_schemas`.
+Standard capability builders live in `deckr::hardware::capabilities`: button
+activation/momentary, encoder relative, touch gesture, raster bitmap, and device
+power. Hardware managers supply device dimensions and constraints rather than
+maintaining local copies of those schemas.
+
 Known pure references to core hardware payload schemas use the corresponding
 Rust validators; compound and extension references use the host's registry.
 No upstream schema bundle is copied into this crate.

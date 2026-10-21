@@ -78,8 +78,8 @@ fn binding(manager: &str, instance: &str) -> BindingMetadata {
         "actionInstanceId":"action-1","bindingId":"binding-1","configId":"layout-1","contextId":"page-1",
         "deviceRef":device,"controlRef":{"deviceRef":device,"controlId":"key"},"outputGeneration":1,
         "matchedCapabilities":[
-            {"capability":{"deviceRef":device,"controlId":"key","capabilityId":"press"},"family":"dev.deckr.input.button","type":"activation","direction":"input","eventTypes":["press"]},
-            {"capability":{"deviceRef":device,"controlId":"key","capabilityId":"lamp"},"family":"org.example.lamp","type":"brightness","direction":"output","commandTypes":["set"]}
+            {"capability":{"deviceRef":device,"controlId":"key","capabilityId":"press"},"family":"dev.deckr.input.button","type":"activation","direction":"input","requirementName":"activate","eventTypes":["press"]},
+            {"capability":{"deviceRef":device,"controlId":"key","capabilityId":"lamp"},"family":"org.example.lamp","type":"brightness","direction":"output","requirementName":"light","commandTypes":["set"],"provenance":"extension"}
         ]
     })).unwrap()
 }
@@ -100,7 +100,10 @@ impl References {
         Arc::new(Self {
             scope: Mutex::new(None),
             binding: Mutex::new(binding),
-            action: ActionDescriptor::from_value(json!({"actionId":"toggle"})).unwrap(),
+            action: ActionDescriptor::from_value(json!({"actionId":"toggle","requirements":[
+                {"name":"activate","preferences":[{"family":"dev.deckr.input.button","type":"activation","direction":"input"}],"eventTypes":["press"],"views":["native"]},
+                {"name":"light","preferences":[{"capabilityId":"lamp","family":"org.example.lamp","commandTypes":["set"]}],"commandTypes":["set"]}
+            ]})).unwrap(),
             device: ValidatedDevice::new(descriptor(), &SchemaRegistry::default()).unwrap(),
         })
     }
@@ -139,7 +142,7 @@ impl ActionReferenceAuthority for References {
 #[derive(Default)]
 struct Driver(Mutex<Vec<HardwareCommandContext>>);
 impl HardwareCommandHandler for Driver {
-    fn handle_authorized_hardware_command<'a>(
+    fn handle_hardware_command<'a>(
         &'a self,
         context: HardwareCommandContext,
     ) -> HardwareCommandFuture<'a> {

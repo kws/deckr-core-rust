@@ -128,7 +128,7 @@ impl Default for Driver {
     }
 }
 impl HardwareCommandHandler for Driver {
-    fn handle_authorized_hardware_command<'a>(
+    fn handle_hardware_command<'a>(
         &'a self,
         context: HardwareCommandContext,
     ) -> HardwareCommandFuture<'a> {

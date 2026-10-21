@@ -394,8 +394,14 @@ impl HardwareLaneTransport for NullLane {
 }
 struct NullHandler;
 impl HardwareCommandHandler for NullHandler {
-    fn handle_hardware_command<'a>(&'a self, _: DeckrMessage) -> HardwareCommandFuture<'a> {
-        Box::pin(async { Ok(HardwareCommandOutcome::Handled) })
+    fn handle_hardware_command<'a>(
+        &'a self,
+        context: deckr::hardware::runtime::HardwareCommandContext,
+    ) -> HardwareCommandFuture<'a> {
+        Box::pin(async move {
+            context.authorize()?;
+            Ok(HardwareCommandOutcome::Handled)
+        })
     }
 }
 
