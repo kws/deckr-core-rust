@@ -197,9 +197,12 @@ impl MessageTarget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeckrMessage {
+    /// Received envelope bytes before transport framing; not a wire field.
+    #[serde(skip)]
+    pub received_size_bytes: Option<usize>,
     pub message_id: String,
     #[serde(default = "default_wire_version")]
     pub protocol_version: String,
@@ -234,7 +237,36 @@ pub struct DeckrMessage {
     pub body: Value,
 }
 
+// Transport metadata is not part of wire message identity.
+impl PartialEq for DeckrMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.message_id == other.message_id
+            && self.protocol_version == other.protocol_version
+            && self.schema_version == other.schema_version
+            && self.lane == other.lane
+            && self.message_type == other.message_type
+            && self.sender == other.sender
+            && self.sender_session_id == other.sender_session_id
+            && self.recipient == other.recipient
+            && self.recipient_session_id == other.recipient_session_id
+            && self.contract == other.contract
+            && self.subject == other.subject
+            && self.created_at == other.created_at
+            && self.expires_at == other.expires_at
+            && self.ttl_ms == other.ttl_ms
+            && self.in_reply_to == other.in_reply_to
+            && self.causation_id == other.causation_id
+            && self.trace == other.trace
+            && self.body == other.body
+    }
+}
+
 impl DeckrMessage {
+    pub fn wire_size_bytes(&self) -> Result<usize> {
+        self.received_size_bytes
+            .map_or_else(|| Ok(self.to_text()?.len()), Ok)
+    }
+
     pub fn hardware_input(
         manager_id: &str,
         sender_session_id: &str,
@@ -332,6 +364,7 @@ impl DeckrMessage {
             None => EntitySubject::hardware_device(manager_id, device_id),
         };
         Ok(Self {
+            received_size_bytes: None,
             message_id: Uuid::new_v4().to_string(),
             protocol_version: DECKR_PROTOCOL_VERSION.to_string(),
             schema_version: "1".to_string(),
@@ -363,8 +396,9 @@ impl DeckrMessage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let message: Self = serde_json::from_value(crate::json::parse(bytes)?)?;
+        let mut message: Self = serde_json::from_value(crate::json::parse(bytes)?)?;
         message.validate()?;
+        message.received_size_bytes = Some(bytes.len());
         Ok(message)
     }
 

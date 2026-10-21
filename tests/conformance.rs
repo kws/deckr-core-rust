@@ -474,10 +474,7 @@ fn service_catalog_compiles_with_upstream_resources_and_validates_its_payloads()
     }
     let validated = ValidatedServiceProtocol::new(protocol.clone(), &registry).unwrap();
     for (name, definition) in &protocol.messages {
-        let path = format!(
-            "fixtures/valid/coverage/deckr/action-runtime/messages/{}.v1.json",
-            name.replace('_', "-")
-        );
+        let path = action_message_fixture(name, true);
         let message = DeckrMessage::from_text(&artifact_text(&path)).unwrap();
         validated
             .validate_message(
@@ -539,13 +536,26 @@ fn action_runtime_models_validate_upstream_positive_and_negative_examples() {
 fn action_runtime_message_shapes_and_settings_keys_follow_upstream_contracts() {
     use deckr::action_runtime::*;
     let declaration: Value = artifact("catalogs/action-runtime-protocol.v1.json");
+    let manifest: Value = artifact("manifest.json");
     for (name, definition) in declaration["messages"].as_object().unwrap() {
-        for (directory, valid) in [("valid", true), ("invalid", false)] {
-            let path = format!(
-                "fixtures/{directory}/coverage/deckr/action-runtime/messages/{}.v1.json",
+        for valid in [true, false] {
+            let schema = format!(
+                "schemas/deckr/action-runtime/messages/{}.v1.schema.json",
                 name.replace('_', "-")
             );
-            let parsed = DeckrMessage::from_text(&artifact_text(&path))
+            let path = manifest["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| {
+                    item["kind"] == "fixture"
+                        && item["valid"] == valid
+                        && item["schemaPath"] == schema
+                })
+                .expect("upstream catalog message has a fixture")["path"]
+                .as_str()
+                .unwrap();
+            let parsed = DeckrMessage::from_text(&artifact_text(path))
                 .and_then(|message| ActionMessage::from_envelope(&message));
             assert_eq!(parsed.is_ok(), valid, "{path}: {:?}", parsed.as_ref().err());
             if let Ok(action) = parsed {
@@ -585,6 +595,77 @@ fn action_runtime_message_shapes_and_settings_keys_follow_upstream_contracts() {
     }
 }
 
+#[test]
+fn rendering_fixtures_and_admission_vectors() {
+    use deckr::action_runtime::*;
+    let manifest: Value = artifact("manifest.json");
+    for fixture in manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| {
+            f["kind"] == "fixture"
+                && f["path"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/action-runtime/rendering/")
+        })
+    {
+        let path = fixture["path"].as_str().unwrap();
+        let value: Value = artifact(path);
+        let schema = fixture["schemaPath"].as_str().unwrap();
+        let result = if schema.contains("/messages/") {
+            DeckrMessage::from_text(&value.to_string())
+                .and_then(|m| ActionMessage::from_envelope(&m))
+                .map(|_| ())
+        } else {
+            match schema
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .trim_end_matches(".v1.schema.json")
+            {
+                "render-limits" => RenderLimits::from_value(value).map(|_| ()),
+                "render-format" => RenderFormat::from_value(value).map(|_| ()),
+                "render-target-support" => RenderTargetSupport::from_value(value).map(|_| ()),
+                "rendering-support" => RenderingSupport::from_value(value).map(|_| ()),
+                "render-text" => RenderText::from_value(value).map(|_| ()),
+                "render-image" => RenderImage::from_value(value).map(|_| ()),
+                "render-content" => RenderContent::from_value(value).map(|_| ()),
+                "binding-render-body" => BindingRenderBody::from_value(value).map(|_| ()),
+                "binding-render-result-body" => {
+                    BindingRenderResultBody::from_value(value).map(|_| ())
+                }
+                other => panic!("unhandled rendering fixture schema {other}"),
+            }
+        };
+        assert_eq!(
+            result.is_ok(),
+            fixture["valid"].as_bool().unwrap(),
+            "{path}: {result:?}"
+        );
+    }
+    let vectors: Value = artifact("vectors/action-runtime-rendering.v1.json");
+    for case in vectors["cases"].as_array().unwrap() {
+        let message = DeckrMessage::from_text(&case["instance"].to_string()).unwrap();
+        let context: RenderCommandContext =
+            serde_json::from_str(&case["context"].to_string()).unwrap();
+        let result = validate_render_command(&message, &context);
+        assert_eq!(
+            result.is_ok(),
+            case["semanticValid"].as_bool().unwrap(),
+            "{}: {result:?}",
+            case["id"]
+        );
+        assert_eq!(
+            result.err().and_then(|e| e.code()),
+            case["expectedCode"].as_str(),
+            "{}",
+            case["id"]
+        );
+    }
+}
+
 fn artifact_text(path: &str) -> String {
     let artifact = artifact_path(path);
     std::fs::read_to_string(&artifact).unwrap_or_else(|error| {
@@ -602,4 +683,23 @@ fn artifact<T: DeserializeOwned>(path: &str) -> T {
             artifact_path(path).display()
         )
     })
+}
+
+fn action_message_fixture(name: &str, valid: bool) -> String {
+    let manifest: Value = artifact("manifest.json");
+    let schema = format!(
+        "schemas/deckr/action-runtime/messages/{}.v1.schema.json",
+        name.replace('_', "-")
+    );
+    manifest["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"] == "fixture" && item["valid"] == valid && item["schemaPath"] == schema
+        })
+        .expect("upstream catalog message has a fixture")["path"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }

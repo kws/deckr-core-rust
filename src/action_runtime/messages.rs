@@ -19,6 +19,8 @@ pub enum ActionMessage {
     CapabilityInput(Box<CapabilityInput>),
     ActionLifecycleRejected(Box<ActionLifecycleRejected>),
     BindingOutput(Box<BindingOutput>),
+    BindingRender(Box<BindingRenderBody>),
+    BindingRenderResult(Box<BindingRenderResultBody>),
     BindingOverlay(Box<BindingOverlay>),
     BindingOverlayClear(Box<BindingOverlayClear>),
     OpenPage(Box<DynamicPageBody>),
@@ -37,6 +39,8 @@ impl ActionMessage {
             Self::CapabilityInput(_) => "capability_input",
             Self::ActionLifecycleRejected(_) => "action_lifecycle_rejected",
             Self::BindingOutput(_) => "binding_output",
+            Self::BindingRender(_) => "binding_render",
+            Self::BindingRenderResult(_) => "binding_render_result",
             Self::BindingOverlay(_) => "binding_overlay",
             Self::BindingOverlayClear(_) => "binding_overlay_clear",
             Self::OpenPage(_) => "open_page",
@@ -52,13 +56,15 @@ impl ActionMessage {
             | Self::BindingDetached(_)
             | Self::PageSessionOpened(_)
             | Self::PageSessionClosed(_)
-            | Self::CapabilityInput(_) => ServiceMessageDirection::ConsumerToService,
+            | Self::CapabilityInput(_)
+            | Self::BindingRenderResult(_) => ServiceMessageDirection::ConsumerToService,
             _ => ServiceMessageDirection::ServiceToConsumer,
         }
     }
     pub fn intent(&self) -> ServiceIntent {
         match self {
             Self::BindingOutput(_)
+            | Self::BindingRender(_)
             | Self::BindingOverlay(_)
             | Self::BindingOverlayClear(_)
             | Self::OpenPage(_)
@@ -78,6 +84,8 @@ impl ActionMessage {
             Self::CapabilityInput(body) => body.to_value(),
             Self::ActionLifecycleRejected(body) => body.to_value(),
             Self::BindingOutput(body) => body.to_value(),
+            Self::BindingRender(body) => body.to_value(),
+            Self::BindingRenderResult(body) => body.to_value(),
             Self::BindingOverlay(body) => body.to_value(),
             Self::BindingOverlayClear(body) => body.to_value(),
             Self::OpenPage(body) => body.to_value(),
@@ -156,6 +164,12 @@ impl ActionMessage {
                 ActionLifecycleRejected::from_value(payload)?,
             )),
             "binding_output" => Self::BindingOutput(Box::new(BindingOutput::from_value(payload)?)),
+            "binding_render" => {
+                Self::BindingRender(Box::new(BindingRenderBody::from_value(payload)?))
+            }
+            "binding_render_result" => {
+                Self::BindingRenderResult(Box::new(BindingRenderResultBody::from_value(payload)?))
+            }
             "binding_overlay" => {
                 Self::BindingOverlay(Box::new(BindingOverlay::from_value(payload)?))
             }
@@ -223,6 +237,13 @@ impl ActionMessage {
             return Err(Error::Invalid(
                 "Action Runtime subject must identify the service and operation".into(),
             ));
+        }
+        if let Self::BindingRenderResult(body) = &action {
+            if message.causation_id.as_deref() != Some(&body.request_message_id) {
+                return Err(Error::Invalid(
+                    "render result causation must identify its request".into(),
+                ));
+            }
         }
         Ok(action)
     }

@@ -60,6 +60,20 @@ authorized command rejections with correlation. `ServiceClientState.contract`
 now exposes the observed agreement identity. Operations still check current
 authority; retaining a state snapshot does not extend an agreement.
 
+Rendering models include `RenderingSupport`, `BindingRenderBody`, and
+`BindingRenderResultBody`. `ActionMessage` and `ActionConnection` carry render
+commands and results through the managed service boundary, with request
+correlation in `causation_id`. `DeckrMessage::wire_size_bytes` retains the received
+UTF-8 envelope size; that observation is not serialized as a wire field.
+
+`validate_rendering_support` checks named raster matches and capability aliases.
+`validate_render_command` accepts current `RenderCommandContext` observations and
+returns the retained binding and target or a stable `RenderError` code. The owner
+must recheck authority and output state at final dispatch. Results can describe
+stale or detached targets and do not grant output authority. Rendering fixtures,
+admission vectors, and managed command/result delivery are covered by conformance
+tests. Image decoding, rendering workers, and output ordering belong to controllers.
+
 ## Requirements
 
 - Rust 1.88 or newer, with Cargo, rustfmt, and Clippy.
@@ -439,7 +453,7 @@ cleanup. Cancelling a caller awaiting `close` does not abandon cleanup. Borrowed
 messaging, protocol sources and view stores remain owned by the host.
 
 The `action_runtime` module provides typed Action Runtime v1 payloads, including
-all fourteen messages, action requirements, binding and page metadata, dynamic
+the core messages, action requirements, binding and page metadata, dynamic
 child selectors, availability and settings identities. Import `ActionModel` to
 use strict `from_text`/`from_value` parsing and validated `to_value` serialization.
 `ActionMessage::from_envelope` checks the one-way message shape and the direct

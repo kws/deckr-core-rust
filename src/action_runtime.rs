@@ -15,6 +15,8 @@ mod messages;
 pub use messages::*;
 mod matching;
 pub use matching::*;
+mod rendering;
+pub use rendering::*;
 mod pages;
 pub use pages::*;
 mod routing;

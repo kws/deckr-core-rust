@@ -514,6 +514,12 @@ impl ActionModel for PageSessionLifecycle {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BindingAttached {
     pub binding: BindingMetadata,
+    #[serde(
+        default,
+        deserialize_with = "super::rendering::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rendering: Option<RenderingSupport>,
     #[serde(default, deserialize_with = "crate::json::deserialize_object")]
     pub settings: Map<String, Value>,
     #[serde(default, deserialize_with = "crate::json::deserialize_object")]
@@ -522,6 +528,9 @@ pub struct BindingAttached {
 impl ActionModel for BindingAttached {
     fn validate(&self) -> Result<()> {
         self.binding.validate()?;
+        if let Some(support) = &self.rendering {
+            support.validate()?;
+        }
         crate::json::validate_numbers(&Value::Object(self.settings.clone()))?;
         crate::json::validate_numbers(&Value::Object(self.internal.clone()))
     }

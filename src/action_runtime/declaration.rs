@@ -90,6 +90,18 @@ pub fn validate_action_runtime_protocol(protocol: &ServiceProtocol) -> Result<()
             ServiceToConsumer,
             "binding-overlay-clear-body",
         ),
+        (
+            "binding_render",
+            Command,
+            ServiceToConsumer,
+            "binding-render-body",
+        ),
+        (
+            "binding_render_result",
+            Event,
+            ConsumerToService,
+            "binding-render-result-body",
+        ),
         ("open_page", Command, ServiceToConsumer, "open-page-body"),
         (
             "replace_page",
@@ -101,7 +113,7 @@ pub fn validate_action_runtime_protocol(protocol: &ServiceProtocol) -> Result<()
     ];
     if protocol.messages.len() != messages.len() || protocol.operations.len() != messages.len() {
         return Err(Error::Invalid(
-            "Action Runtime requires the fourteen core operations and messages".into(),
+            "Action Runtime requires the complete core operations and messages".into(),
         ));
     }
     for (name, intent, direction, schema) in messages {

@@ -202,7 +202,7 @@ fn wire_body(name: &str, payload: Value) -> ServiceMessageBody {
     ServiceMessageBody::from_value(body).unwrap()
 }
 #[test]
-fn all_fourteen_messages_enforce_payload_positions_names_and_reply_exclusion() {
+fn core_messages_enforce_payload_positions_names_and_reply_exclusion() {
     for (name, payload) in message_values() {
         let body = wire_body(name, payload);
         let message = ActionMessage::from_body(&body).unwrap();

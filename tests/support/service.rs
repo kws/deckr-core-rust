@@ -165,6 +165,7 @@ impl Harness {
             )
         };
         DeckrMessage {
+            received_size_bytes: None,
             message_id: uuid::Uuid::new_v4().to_string(),
             protocol_version: "1".into(),
             schema_version: "1".into(),

@@ -36,6 +36,9 @@ pub struct ActionScope {
 /// Controller lifecycle events may introduce controller-assigned IDs according
 /// to the receiving runtime's lifecycle policy. Runtime commands must never
 /// allocate bindings or turn an unknown ID into current authority.
+/// Use `validate_render_command` with current observations for render commands.
+/// Render results describe past requests, including detached or stale targets;
+/// they require current service authority but not a current target binding.
 ///
 /// Page commands have no wire opener ID. The owner must resolve their opener
 /// and current page from its authorized scope/subject, or reject ambiguity;
@@ -136,7 +139,10 @@ impl<C: StateStore, T: StateStore, M: MessageTransport> ActionConnection<C, T, M
     /// and expiry before `send`; reference resolution occurs at send time.
     pub fn message(&self, action: &ActionMessage) -> Result<DeckrMessage> {
         action.validate_provider(&self.scope.provider_instance_id, &self.scope.provider_id)?;
-        let message = self.service.message(action.to_body()?)?;
+        let mut message = self.service.message(action.to_body()?)?;
+        if let ActionMessage::BindingRenderResult(body) = action {
+            message.causation_id = Some(body.request_message_id.clone());
+        }
         ActionMessage::from_envelope(&message)?;
         // Scope/direction checks, without requiring page subject information
         // that the caller has not yet had a chance to add.

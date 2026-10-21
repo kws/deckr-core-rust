@@ -73,6 +73,7 @@ struct References {
     calls: AtomicUsize,
     panic: AtomicBool,
     page_ready: AtomicBool,
+    rendering: Mutex<Option<RenderCommandContext>>,
 }
 impl References {
     fn new() -> Arc<Self> {
@@ -82,6 +83,7 @@ impl References {
             calls: AtomicUsize::new(0),
             panic: AtomicBool::new(false),
             page_ready: AtomicBool::new(false),
+            rendering: Mutex::new(None),
         })
     }
     fn bind(&self, action: &Action) {
@@ -92,7 +94,7 @@ impl ActionReferenceAuthority for References {
     fn authorize(
         &self,
         scope: &ActionScope,
-        _envelope: &DeckrMessage,
+        envelope: &DeckrMessage,
         action: &ActionMessage,
     ) -> Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -104,6 +106,18 @@ impl ActionReferenceAuthority for References {
         }
         let current = self.binding.lock().unwrap();
         match action {
+            ActionMessage::BindingRender(_) => {
+                let state = self.rendering.lock().unwrap();
+                let context = state
+                    .as_ref()
+                    .ok_or_else(|| Error::Unauthorized("no render target observations".into()))?;
+                validate_render_command(envelope, context)
+                    .map(|_| ())
+                    .map_err(Error::from)
+            }
+            // A result can refer to a detached target; the connection still
+            // checks its current service agreement and endpoint sessions.
+            ActionMessage::BindingRenderResult(_) => Ok(()),
             ActionMessage::BindingOverlay(body) => validate_binding_overlay(body, &current),
             ActionMessage::BindingOverlayClear(body) => {
                 validate_binding_overlay_clear(body, &current)
@@ -134,6 +148,70 @@ impl ActionReferenceAuthority for References {
             )),
         }
     }
+}
+
+#[tokio::test]
+async fn managed_render_commands_and_results_keep_identity_and_authority() {
+    let h = Harness::new().await;
+    let provider = h.provider_action();
+    let vectors: serde_json::Value = super::artifact("vectors/action-runtime-rendering.v1.json");
+    let sample = &vectors["cases"][0];
+    let mut context: RenderCommandContext =
+        serde_json::from_str(&sample["context"].to_string()).unwrap();
+    let scope = h.action.scope();
+    context.contract = scope.contract.clone();
+    context.controller_endpoint = scope.controller_endpoint.to_string();
+    context.controller_session_id = scope.controller_session_id.clone();
+    context.runtime_endpoint = scope.service_endpoint.to_string();
+    context.runtime_session_id = scope.service_session_id.clone();
+    for current in context.bindings.values_mut() {
+        current.contract = context.contract.clone();
+        current.runtime_endpoint = context.runtime_endpoint.clone();
+        current.runtime_session_id = context.runtime_session_id.clone();
+        current.binding.provider_instance_id = scope.provider_instance_id.clone();
+    }
+    *h.references.rendering.lock().unwrap() = Some(context.clone());
+    *h.backend.references.rendering.lock().unwrap() = Some(context);
+    let render = ActionMessage::BindingRender(Box::new(
+        BindingRenderBody::from_value(sample["instance"]["body"]["params"].clone()).unwrap(),
+    ));
+    let mut reader = h.client.watch_messages().unwrap();
+    let command = provider.message(&render).unwrap();
+    provider.send(command.clone()).await.unwrap();
+    let accepted = h
+        .action
+        .accept(bounded(reader.next()).await.unwrap().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(accepted.message().message_id, command.message_id);
+    h.references
+        .rendering
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .bindings
+        .get_mut("binding-17")
+        .unwrap()
+        .active = false;
+    assert!(accepted.authorize().is_err());
+    let result = ActionMessage::BindingRenderResult(Box::new(BindingRenderResultBody::from_value(serde_json::json!({
+        "requestMessageId":command.message_id, "target":sample["instance"]["body"]["params"]["target"], "requirementName":"display",
+        "stage":"controller", "status":"superseded", "code":"target_not_current"
+    })).unwrap()));
+    let outgoing = h.action.message(&result).unwrap();
+    assert_eq!(
+        outgoing.causation_id.as_deref(),
+        Some(command.message_id.as_str())
+    );
+    assert!(outgoing.in_reply_to.is_none());
+    h.action.send(outgoing.clone()).await.unwrap();
+    until(|| !h.backend.received.lock().unwrap().is_empty()).await;
+    assert_eq!(
+        h.backend.received.lock().unwrap()[0].message().message_id,
+        outgoing.message_id
+    );
+    h.close().await;
 }
 struct Backend {
     references: Arc<References>,
