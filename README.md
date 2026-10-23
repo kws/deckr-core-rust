@@ -115,6 +115,17 @@ assert_eq!(
 
 ### Runtime lifetimes and state views
 
+`DeckrRuntime::connect` and `NatsDeckrRuntime` load an explicitly configured
+[trusted restart handoff](https://github.com/kws/deckr/blob/main/docs/deckr-deployment.md#verified-restart-handoff)
+from `DECKR_RESTART_HANDOFF`, checking `DECKR_INSTANCE_ID`. Other hosts can parse
+`restart::VerifiedRestart` and pass it through `ConcordCoordinator::with_restart`.
+Managed Concord, hardware, and service bootstrap cancel verified predecessor
+participation and confirm cleanup before readiness, including contracts created
+by a consumer. Exact dead-session discovery records can then be removed.
+A different session without exit evidence is still a competing live instance;
+exclusive admission preserves that instance and reports contention. Successors
+must use fresh sessions and fresh contracts. Retained proof cannot cancel them.
+
 Materialized stores install complete snapshots and consume ordered observations.
 Exact mutations wait for their committed revision to arrive through the watch;
 they never inject state into the cache. Custom `StateStore` adapters used with

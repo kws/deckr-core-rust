@@ -1263,8 +1263,9 @@ async fn publication_updates<C: StateStore, T: StateStore, M: MessageTransport>(
         }
     }
 }
-async fn bootstrap_provider<C: StateStore, T: StateStore, M: MessageTransport>(
+async fn bootstrap_provider<B: StateStore, C: StateStore, T: StateStore, M: MessageTransport>(
     shared: &Shared<C, T, M>,
+    advertisements: &B,
 ) -> Result<()> {
     let mut retry_delay = Duration::from_millis(100);
     loop {
@@ -1272,11 +1273,25 @@ async fn bootstrap_provider<C: StateStore, T: StateStore, M: MessageTransport>(
             shared.clock.as_ref(),
             shared.options.bootstrap_timeout,
             "service provider bootstrap",
-            shared.concord.bootstrap(
-                shared.messages.session(),
-                Some(&shared.descriptor.use_profile),
-                true,
-            ),
+            async {
+                shared
+                    .concord
+                    .bootstrap(
+                        shared.messages.session(),
+                        Some(&shared.descriptor.use_profile),
+                        true,
+                    )
+                    .await?;
+                if let Some(proof) = shared.concord.restart_evidence() {
+                    crate::beacon::cleanup_restart_advertisements(
+                        advertisements,
+                        proof,
+                        &shared.descriptor.endpoint,
+                    )
+                    .await?;
+                }
+                Ok(())
+            },
         )
         .await;
         match result {
@@ -1326,7 +1341,7 @@ async fn supervise<B: StateStore, C: StateStore, T: StateStore, M: MessageTransp
             profile: Some(&shared.descriptor.use_profile),
             ..Default::default()
         })?;
-        bootstrap_provider(&shared).await?;
+        bootstrap_provider(&shared, &advertisements).await?;
         let participant = {
             let mut owned = shared
                 .participant

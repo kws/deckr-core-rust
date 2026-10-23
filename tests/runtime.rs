@@ -416,7 +416,7 @@ async fn beacon_advertisement_uses_bucket_ttl_and_coalesces_unchanged_refreshes(
 }
 
 #[tokio::test]
-async fn beacon_cleanup_stale_same_endpoint_removes_old_identity_only() {
+async fn beacon_verified_restart_removes_only_confirmed_predecessor() {
     let state = MemoryStateStore::ttl_bound(DEFAULT_BEACON_TTL_SECONDS).unwrap();
     let endpoint = EndpointAddress::parse("hardware_manager:mirabox-main").unwrap();
     let other_endpoint = EndpointAddress::parse("hardware_manager:other").unwrap();
@@ -445,7 +445,13 @@ async fn beacon_cleanup_stale_same_endpoint_removes_old_identity_only() {
     let other_same_feature_handle = other_same_feature.publish().await.unwrap();
     let other_feature_handle = other_feature.publish().await.unwrap();
 
-    assert_eq!(current.cleanup_stale_same_endpoint().await.unwrap(), 1);
+    let proof = deckr::restart::VerifiedRestart::from_handoff(json!({
+        "schema": "dev.deckr.runtime.restart_handoff.v1", "instanceId": "hardware",
+        "predecessors": [{"predecessorId": "container:old", "exitCode": 137,
+          "participants": [{"endpoint": "hardware_manager:mirabox-main", "sessionId": "old-session"}]}]
+    }), "hardware").unwrap();
+    assert_eq!(current.cleanup_restart(&proof).await.unwrap(), 1);
+    assert_eq!(current.cleanup_restart(&proof).await.unwrap(), 0);
 
     assert!(state.get(&stale_handle.key).await.unwrap().is_none());
     assert!(state.get(&current_handle.key).await.unwrap().is_some());

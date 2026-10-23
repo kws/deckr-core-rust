@@ -1131,8 +1131,10 @@ pub mod runtime {
             let messages = self
                 .starting_step(lane.subscribe_hardware_deliveries(&endpoint))
                 .await?;
-            self.starting_step(advertiser.cleanup_stale_same_endpoint())
-                .await?;
+            if let Some(proof) = self.sources.restart_evidence() {
+                self.starting_step(advertiser.cleanup_restart(proof))
+                    .await?;
+            }
             let weak = Arc::downgrade(&self.inner);
             let participant = self.sources.participate(
                 session,

@@ -31,6 +31,7 @@ pub mod messaging;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod profiles;
+pub mod restart;
 pub mod runtime;
 pub mod schema;
 pub mod services;

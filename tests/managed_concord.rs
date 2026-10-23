@@ -805,3 +805,115 @@ async fn attachment_conflicts_wait_for_the_selected_contract() {
     bounded(proposal.close()).await.unwrap();
     concord.close_sources_and_wait().await;
 }
+
+#[tokio::test]
+async fn verified_restart_recovers_before_expiry_and_preserves_competing_and_successor_sessions() {
+    use deckr::concord::CreateContractSpec;
+    use deckr::restart::VerifiedRestart;
+    let (concord, _, tokens, _) = setup().await;
+    let provider = EndpointAddress::parse_protocol("service:restart").unwrap();
+    let client = EndpointAddress::parse_protocol("controller:restart").unwrap();
+    let proof = VerifiedRestart::from_handoff(
+        serde_json::json!({
+            "schema":"dev.deckr.runtime.restart_handoff.v1", "instanceId":"provider",
+            "predecessors":[{"predecessorId":"container:process-start", "exitCode":137,
+            "participants":[{"endpoint":"service:restart", "sessionId":"dead"}]}]
+        }),
+        "provider",
+    )
+    .unwrap();
+    let mut all = Vec::new();
+    let mut old_token = None;
+    for (index, (id, owned, attached)) in [
+        ("dead", false, true),
+        ("dead", true, true),
+        ("live", false, true),
+        ("successor", false, true),
+        ("dead", false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut spec = CreateContractSpec::new(vec![client.clone(), provider.clone()]);
+        spec.created_by = Some(if owned {
+            provider.clone()
+        } else {
+            client.clone()
+        });
+        spec.profile = Some(
+            if owned {
+                "example.other.v1"
+            } else {
+                "example.service.v1"
+            }
+            .into(),
+        );
+        spec.participant_sessions
+            .insert(provider.to_string(), id.into());
+        let contract = concord.create_contract(spec).await.unwrap();
+        concord
+            .attach(&contract, &client, "client", None)
+            .await
+            .unwrap();
+        if attached {
+            let token = concord
+                .attach(&contract, &provider, id, None)
+                .await
+                .unwrap();
+            if index == 0 {
+                old_token = Some(token);
+            }
+        }
+        all.push(contract);
+    }
+    let successor = EndpointSession::with_id(provider.clone(), "successor").unwrap();
+    bounded(concord.bootstrap(&successor, None, false))
+        .await
+        .unwrap();
+    assert!(concord.validate(&all[0], None).await.valid());
+    let restarted = concord.clone().with_restart(Some(proof));
+    bounded(restarted.bootstrap(&successor, Some("example.service.v1"), false))
+        .await
+        .unwrap();
+    assert!(
+        tokens.get(&old_token.unwrap().key).await.unwrap().is_some(),
+        "120-second token is still present"
+    );
+    for contract in &all[..2] {
+        assert_eq!(
+            concord.validate(contract, None).await.status,
+            ContractValidityStatus::Cancelled
+        );
+    }
+    for contract in &all[2..4] {
+        assert!(concord.validate(contract, None).await.valid());
+    }
+    assert_eq!(
+        concord.validate(&all[4], None).await.status,
+        ContractValidityStatus::NotYetFulfilled
+    );
+    bounded(restarted.bootstrap(&successor, None, false))
+        .await
+        .unwrap();
+    assert!(
+        concord.validate(&all[3], None).await.valid(),
+        "replayed proof preserves successor"
+    );
+    assert!(restarted
+        .bootstrap(
+            &EndpointSession::with_id(provider.clone(), "dead").unwrap(),
+            None,
+            false
+        )
+        .await
+        .is_err());
+    assert!(restarted
+        .bootstrap(
+            &EndpointSession::with_id(provider, "another").unwrap(),
+            None,
+            true
+        )
+        .await
+        .is_err());
+    concord.close_sources_and_wait().await;
+}

@@ -503,35 +503,8 @@ impl<S: StateStore> BeaconAdvertiser<S> {
         self.state.delete(&handle.key, Some(current.revision)).await
     }
 
-    pub async fn cleanup_stale_same_endpoint(&self) -> Result<usize> {
-        let prefix = beacon_feature_prefix(&self.feature_id);
-        let mut removed = 0;
-        for entry in self.state.items(&prefix).await? {
-            let Some((feature_id, advertisement_id)) = parse_beacon_advertisement_key(&entry.key)
-            else {
-                continue;
-            };
-            if feature_id != self.feature_id {
-                continue;
-            }
-            let Ok(record) = AdvertisementRecord::from_value(entry.value) else {
-                continue;
-            };
-            if record.feature_id != self.feature_id
-                || record.advertisement_id != advertisement_id
-                || record.advertiser != self.advertiser
-                || record.endpoint != self.endpoint
-                || advertisement_matches_advertiser(&record, self)
-            {
-                continue;
-            }
-            match self.state.delete(&entry.key, Some(entry.revision)).await {
-                Ok(()) => removed += 1,
-                Err(error) if error.is_state_conflict() => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(removed)
+    pub async fn cleanup_restart(&self, proof: &crate::restart::VerifiedRestart) -> Result<usize> {
+        cleanup_restart_advertisements(&self.state, proof, &self.endpoint).await
     }
 
     async fn bucket_ttl_seconds(&self) -> Result<u64> {
@@ -736,17 +709,6 @@ fn advertisement_matches_handle(
         && record.session_id == handle.session_id
 }
 
-fn advertisement_matches_advertiser<S: StateStore>(
-    record: &AdvertisementRecord,
-    advertiser: &BeaconAdvertiser<S>,
-) -> bool {
-    record.advertisement_id == advertiser.advertisement_id
-        && record.feature_id == advertiser.feature_id
-        && record.advertiser == advertiser.advertiser
-        && record.endpoint == advertiser.endpoint
-        && record.session_id == advertiser.session_id
-}
-
 fn advertisement_content_matches(
     current: &AdvertisementRecord,
     desired: &AdvertisementRecord,
@@ -772,4 +734,39 @@ fn next_refresh_seq(previous: u64) -> Result<u64> {
     previous
         .checked_add(1)
         .ok_or_else(|| Error::StateConflict("Beacon refresh sequence exhausted".into()))
+}
+
+/// Discovery cleanup using confirmed process-exit evidence, never discovery as authority.
+pub async fn cleanup_restart_advertisements<S: StateStore>(
+    state: &S,
+    proof: &crate::restart::VerifiedRestart,
+    endpoint: &EndpointAddress,
+) -> Result<usize> {
+    let mut removed = 0;
+    for entry in state.items("advertisements.by_feature.").await? {
+        if entry.value.get("endpoint").and_then(Value::as_str) != Some(endpoint.as_str())
+            || entry.value.get("advertiser").and_then(Value::as_str) != Some(endpoint.as_str())
+            || !entry
+                .value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_some_and(|session| proof.contains(endpoint, session))
+        {
+            continue;
+        }
+        let record = AdvertisementRecord::from_value(entry.value)?;
+        if parse_beacon_advertisement_key(&entry.key)
+            != Some((record.feature_id.clone(), record.advertisement_id.clone()))
+        {
+            continue;
+        }
+        state.delete(&entry.key, Some(entry.revision)).await?;
+        if state.get(&entry.key).await?.is_some() {
+            return Err(Error::StateUnavailable(
+                "restart advertisement cleanup is not confirmed".into(),
+            ));
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }

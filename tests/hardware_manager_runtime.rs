@@ -998,7 +998,7 @@ async fn publishes_beacon_payload_and_skips_noop_refresh() {
 }
 
 #[tokio::test]
-async fn startup_removes_stale_hardware_beacon_for_same_manager_endpoint() {
+async fn startup_preserves_competing_hardware_beacon_without_exit_evidence() {
     let h = harness().await;
     let manager = EndpointAddress::parse("hardware_manager:manager-main").unwrap();
     let stale_advertiser = BeaconAdvertiser::new(
@@ -1013,14 +1013,13 @@ async fn startup_removes_stale_hardware_beacon_for_same_manager_endpoint() {
 
     let tasks = start_runtime(&h).await;
 
-    assert!(h.beacon_state.get(&stale.key).await.unwrap().is_none());
+    assert!(h.beacon_state.get(&stale.key).await.unwrap().is_some());
     let beacon = Beacon::start(h.beacon_state.clone()).await.unwrap();
     let candidates = beacon.candidates(HARDWARE_FEATURE_ID).unwrap();
-    assert_eq!(candidates.len(), 1);
-    assert_ne!(
-        candidates[0].advertisement.advertisement_id,
-        "stale-hardware-ad"
-    );
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates
+        .iter()
+        .any(|candidate| candidate.advertisement.advertisement_id == "stale-hardware-ad"));
 
     stop_runtime(&h, tasks).await;
 }
@@ -1723,19 +1722,31 @@ async fn stopping_during_startup_cannot_publish_or_spawn_late_workers() {
     let lane = MemoryHardwareLane::default();
     let beacon = SlowBeaconStore::new(&lane);
     beacon.block_listings.store(true, Ordering::SeqCst);
-    let runtime = HardwareManagerRuntime::new(HardwareManagerRuntimeSpec {
-        manager_id: "manager-main".into(),
-        session_id: "manager-session".into(),
-        labels: BTreeMap::new(),
-        beacon_state: beacon.clone(),
-        concord_contract_state: MemoryStateStore::new(),
-        concord_token_state: MemoryStateStore::ttl_bound(30).unwrap(),
-        lane,
-        maintenance_policy: StateMaintenancePolicy::default(),
-        command_handler: Arc::new(RecordingCommandHandler::default()),
-        reset_handler: None,
-    })
-    .await
+    let contracts = MemoryStateStore::new();
+    let tokens = MemoryStateStore::ttl_bound(30).unwrap();
+    let sources = ConcordCoordinator::new(
+        deckr::state::MaterializedStateStore::start(contracts.clone(), "contracts.").await.unwrap(),
+        deckr::state::MaterializedStateStore::start(tokens.clone(), "contracts.").await.unwrap(),
+    ).with_restart(Some(deckr::restart::VerifiedRestart::from_handoff(serde_json::json!({
+        "schema":"dev.deckr.runtime.restart_handoff.v1", "instanceId":"hardware",
+        "predecessors":[{"predecessorId":"container:old", "exitCode":137,
+          "participants":[{"endpoint":"hardware_manager:manager-main", "sessionId":"old-manager"}]}]
+    }), "hardware").unwrap()));
+    let runtime = HardwareManagerRuntime::with_concord(
+        HardwareManagerRuntimeSpec {
+            manager_id: "manager-main".into(),
+            session_id: "manager-session".into(),
+            labels: BTreeMap::new(),
+            beacon_state: beacon.clone(),
+            concord_contract_state: contracts,
+            concord_token_state: tokens,
+            lane,
+            maintenance_policy: StateMaintenancePolicy::default(),
+            command_handler: Arc::new(RecordingCommandHandler::default()),
+            reset_handler: None,
+        },
+        sources,
+    )
     .unwrap();
     runtime.set_device(descriptor("deck")).await.unwrap();
     let starting = runtime.clone();
@@ -1770,19 +1781,31 @@ async fn cancelled_start_cleans_up_without_an_explicit_stop_call() {
     let lane = MemoryHardwareLane::default();
     let beacon = SlowBeaconStore::new(&lane);
     beacon.block_listings.store(true, Ordering::SeqCst);
-    let runtime = HardwareManagerRuntime::new(HardwareManagerRuntimeSpec {
-        manager_id: "manager-main".into(),
-        session_id: "manager-session".into(),
-        labels: BTreeMap::new(),
-        beacon_state: beacon.clone(),
-        concord_contract_state: MemoryStateStore::new(),
-        concord_token_state: MemoryStateStore::ttl_bound(30).unwrap(),
-        lane,
-        maintenance_policy: StateMaintenancePolicy::default(),
-        command_handler: Arc::new(RecordingCommandHandler::default()),
-        reset_handler: None,
-    })
-    .await
+    let contracts = MemoryStateStore::new();
+    let tokens = MemoryStateStore::ttl_bound(30).unwrap();
+    let sources = ConcordCoordinator::new(
+        deckr::state::MaterializedStateStore::start(contracts.clone(), "contracts.").await.unwrap(),
+        deckr::state::MaterializedStateStore::start(tokens.clone(), "contracts.").await.unwrap(),
+    ).with_restart(Some(deckr::restart::VerifiedRestart::from_handoff(serde_json::json!({
+        "schema":"dev.deckr.runtime.restart_handoff.v1", "instanceId":"hardware",
+        "predecessors":[{"predecessorId":"container:old", "exitCode":137,
+          "participants":[{"endpoint":"hardware_manager:manager-main", "sessionId":"old-manager"}]}]
+    }), "hardware").unwrap()));
+    let runtime = HardwareManagerRuntime::with_concord(
+        HardwareManagerRuntimeSpec {
+            manager_id: "manager-main".into(),
+            session_id: "manager-session".into(),
+            labels: BTreeMap::new(),
+            beacon_state: beacon.clone(),
+            concord_contract_state: contracts,
+            concord_token_state: tokens,
+            lane,
+            maintenance_policy: StateMaintenancePolicy::default(),
+            command_handler: Arc::new(RecordingCommandHandler::default()),
+            reset_handler: None,
+        },
+        sources,
+    )
     .unwrap();
     let starting = runtime.clone();
     let task = tokio::spawn(async move {

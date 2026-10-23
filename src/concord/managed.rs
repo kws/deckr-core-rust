@@ -73,6 +73,15 @@ impl<C: StateStore, T: StateStore>
         if session.is_closed() {
             return Err(Error::Closed("endpoint session closed".into()));
         }
+        if self
+            .restart
+            .as_ref()
+            .is_some_and(|proof| proof.contains(session.endpoint(), session.id()))
+        {
+            return Err(Error::Invalid(
+                "a restarted endpoint must use a fresh session".into(),
+            ));
+        }
         self.wait_current().await?;
         // Keep raw matching records: malformed ownership evidence is an
         // unresolved bootstrap condition, not evidence that the role is free.
@@ -84,17 +93,19 @@ impl<C: StateStore, T: StateStore>
             let Some((contract_id, generation)) = parse_concord_contract_key(&entry.key) else {
                 continue;
             };
-            if profile.is_some_and(|profile| {
-                entry.value.get("profile").and_then(Value::as_str) != Some(profile)
-            }) || !entry
-                .value
-                .get("participants")
-                .and_then(Value::as_array)
-                .is_some_and(|participants| {
-                    participants.iter().any(|participant| {
-                        participant.as_str() == Some(session.endpoint().as_str())
+            if (self.restart.is_none()
+                && profile.is_some_and(|profile| {
+                    entry.value.get("profile").and_then(Value::as_str) != Some(profile)
+                }))
+                || !entry
+                    .value
+                    .get("participants")
+                    .and_then(Value::as_array)
+                    .is_some_and(|participants| {
+                        participants.iter().any(|participant| {
+                            participant.as_str() == Some(session.endpoint().as_str())
+                        })
                     })
-                })
             {
                 continue;
             }
@@ -113,6 +124,36 @@ impl<C: StateStore, T: StateStore>
         }
         for contract in candidates {
             let observed = self.validate(&contract, None).await;
+            let verified_restart = observed
+                .tokens
+                .get(session.endpoint().as_str())
+                .is_some_and(|token| {
+                    self.restart
+                        .as_ref()
+                        .is_some_and(|proof| proof.contains(session.endpoint(), &token.session_id))
+                });
+            if verified_restart
+                && matches!(
+                    observed.status,
+                    ContractValidityStatus::Valid | ContractValidityStatus::NotYetFulfilled
+                )
+            {
+                self.cancel(
+                    &contract,
+                    session.endpoint(),
+                    Some("verified_restart".into()),
+                )
+                .await?;
+                if !matches!(
+                    self.validate(&contract, None).await.status,
+                    ContractValidityStatus::Cancelled | ContractValidityStatus::MissingContract
+                ) {
+                    return Err(Error::StateUnavailable(
+                        "restart cleanup is not confirmed".into(),
+                    ));
+                }
+                continue;
+            }
             match observed.status {
                 ContractValidityStatus::Cancelled | ContractValidityStatus::MissingContract => {
                     continue
@@ -143,7 +184,10 @@ impl<C: StateStore, T: StateStore>
                         .tokens
                         .get(session.endpoint().as_str())
                         .is_some_and(|token| token.session_id != session.id());
-                    if exclusive && competing {
+                    if exclusive
+                        && competing
+                        && profile.is_none_or(|value| contract.profile.as_deref() == Some(value))
+                    {
                         return Err(Error::StateConflict(
                             "exclusive endpoint ownership is unresolved".into(),
                         ));

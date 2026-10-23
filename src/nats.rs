@@ -110,6 +110,7 @@ impl DeckrRuntime {
             self.inner.concord_contracts().clone(),
             self.inner.concord_tokens().clone(),
         )
+        .with_restart(self.inner.restart.clone())
     }
 
     pub async fn materialized_concord(
@@ -256,6 +257,7 @@ pub struct NatsDeckrRuntime {
     service_views: Arc<Mutex<ServiceViewSources>>,
     source_gate: Arc<tokio::sync::RwLock<()>>,
     source_stop: crate::lifecycle::Cancellation,
+    restart: Option<crate::restart::VerifiedRestart>,
 }
 
 impl std::fmt::Debug for NatsDeckrRuntime {
@@ -378,6 +380,7 @@ impl NatsDeckrRuntime {
             service_views: Arc::default(),
             source_gate: Arc::default(),
             source_stop: Default::default(),
+            restart: crate::restart::restart_handoff_from_env()?,
         })
     }
 
@@ -419,7 +422,8 @@ impl NatsDeckrRuntime {
                             crate::keys::concord_contracts_prefix(),
                         )
                         .await?,
-                    ))
+                    )
+                    .with_restart(self.restart.clone()))
                 })
                 .await
                 .cloned()

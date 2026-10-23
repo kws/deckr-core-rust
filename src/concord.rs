@@ -776,6 +776,7 @@ impl ConcordParticipantLease {
 
 #[derive(Debug, Clone)]
 pub struct ConcordCoordinator<C: StateStore, T: StateStore> {
+    restart: Option<crate::restart::VerifiedRestart>,
     contract_state: C,
     token_state: T,
     clock: Arc<dyn crate::lifecycle::Clock>,
@@ -791,6 +792,7 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
     }
     pub fn new(contract_state: C, token_state: T) -> Self {
         Self {
+            restart: None,
             contract_state,
             token_state,
             clock: Arc::new(crate::lifecycle::SystemClock),
@@ -801,6 +803,16 @@ impl<C: StateStore, T: StateStore> ConcordCoordinator<C, T> {
     pub fn clock(mut self, clock: Arc<dyn crate::lifecycle::Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Configure trusted host evidence before creating managed endpoint lifetimes.
+    pub fn with_restart(mut self, restart: Option<crate::restart::VerifiedRestart>) -> Self {
+        self.restart = restart;
+        self
+    }
+
+    pub fn restart_evidence(&self) -> Option<&crate::restart::VerifiedRestart> {
+        self.restart.as_ref()
     }
 
     pub(crate) fn runtime_clock(&self) -> Arc<dyn crate::lifecycle::Clock> {
