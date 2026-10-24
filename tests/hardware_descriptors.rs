@@ -267,6 +267,58 @@ fn extension_state_values_obey_schema_units_and_constraints() {
 }
 
 #[test]
+fn raster_limits_precede_decoder_work() {
+    use base64::Engine;
+    let mut value = descriptor();
+    value["controls"][0]["outputCapabilities"][0]["commandSchema"] = json!({"schema":{
+        "type":"object", "properties":{"image":{"type":"string","maxLength":4}}
+    }});
+    let device = ValidatedDevice::new(
+        serde_json::from_value(value.clone()).unwrap(),
+        &SchemaRegistry::default(),
+    )
+    .unwrap();
+    let error = device
+        .validate_message(&command(
+            json!({"image":"not-base64-and-too-long","encoding":"png"}),
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !error.contains("not valid base64"),
+        "schema must reject before decoding: {error}"
+    );
+
+    value["controls"][0]["outputCapabilities"][0]["commandSchema"] =
+        json!({"schema":{"type":"object"}});
+    value["controls"][0]["outputCapabilities"][0]["constraints"] =
+        json!([{"type":"range","subject":"width","maximum":1}]);
+    let device = ValidatedDevice::new(
+        serde_json::from_value(value).unwrap(),
+        &SchemaRegistry::default(),
+    )
+    .unwrap();
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 3)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let mut bytes = bytes.into_inner();
+    // Keep the complete header, but corrupt IDAT data. The descriptor range
+    // must fail before a decoder gets far enough to report the corrupt pixels.
+    let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap();
+    bytes[idat + 4] ^= 0xff;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let error = device
+        .validate_message(&command(json!({"image":encoded,"encoding":"png"})))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("constraint"),
+        "expected header constraint rejection: {error}"
+    );
+}
+
+#[test]
 fn numeric_checks_preserve_large_integers_and_exact_decimal_steps() {
     let mut value = descriptor();
     let capability = &mut value["controls"][0]["stateCapabilities"][0];

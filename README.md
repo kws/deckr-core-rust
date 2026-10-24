@@ -180,7 +180,10 @@ failures in closed state even when an earlier device operation reported them.
 Hardware descriptors preserve connections, sources, projections, units, control
 relationships and every capability collection. `ValidatedDevice` compiles
 descriptor schemas and validates capability lookup, operation support, values,
-constraints, and core raster image bytes and dimensions. Numeric step and scaled
+constraints, and core raster image bytes and dimensions. Embedded payload limits
+run before base64 decoding. Raster dimensions are checked against the descriptor
+before full image decoding, which has a 64 MiB decoder allocation limit. A valid
+header alone is not sufficient: the complete image must also decode. Numeric step and scaled
 range checks retain decimal precision; exponent expansion is limited to 10,000
 places. The manager performs schema and image work off the async scheduler and
 checks current authority again before dispatch. Drivers doing asynchronous work

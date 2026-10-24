@@ -189,10 +189,12 @@ impl ValidatedDevice {
                         && capability.command_types.contains(command_type),
                 )?;
                 let value = Value::Object(params.clone());
+                // Embedded size limits must run before base64 and image decoding.
+                validate_optional(&schemas.command, &value)?;
                 let dimensions = match capability.family.as_str() {
                     "dev.deckr.output.raster" if command_type == "set_frame" => {
                         CorePayload::Frame.validate(&value)?;
-                        let (width, height) = validate_raster(params)?;
+                        let (width, height) = validate_raster(params, capability)?;
                         BTreeMap::from([
                             ("width", Value::from(width)),
                             ("height", Value::from(height)),
@@ -204,7 +206,6 @@ impl ValidatedDevice {
                     }
                     _ => BTreeMap::new(),
                 };
-                validate_optional(&schemas.command, &value)?;
                 validate_constraints(capability, &value, &dimensions)
             }
             HardwareMessageBody::CapabilityStateRequest { .. } => {
@@ -426,7 +427,10 @@ fn validate_core_input(
     Ok(())
 }
 
-fn validate_raster(params: &Map<String, Value>) -> Result<(u32, u32)> {
+fn validate_raster(
+    params: &Map<String, Value>,
+    capability: &CapabilityDescriptor,
+) -> Result<(u32, u32)> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(params["image"].as_str().ok_or_else(invalid)?)
         .map_err(|_| Error::Invalid("raster image is not valid base64".into()))?;
@@ -442,8 +446,29 @@ fn validate_raster(params: &Map<String, Value>) -> Result<(u32, u32)> {
             "raster encoding disagrees with image bytes".into(),
         ));
     }
-    // Decode the complete image, not just an untrusted dimensions header.
-    let image = image::ImageReader::with_format(Cursor::new(bytes), actual)
+    // Enforce descriptor dimensions before allocating the full raster. Bound
+    // ancillary decoder allocations as well as pixels (for example PNG metadata).
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    let mut header = image::ImageReader::with_format(Cursor::new(&bytes), actual);
+    header.limits(limits.clone());
+    let (width, height) = header
+        .into_dimensions()
+        .map_err(|error| Error::Invalid(format!("invalid raster header: {error}")))?;
+    validate_constraints(
+        capability,
+        &Value::Object(params.clone()),
+        &BTreeMap::from([
+            ("width", Value::from(width)),
+            ("height", Value::from(height)),
+        ]),
+    )?;
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    // Still decode the complete image; a valid header alone is not validation.
+    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), actual);
+    reader.limits(limits);
+    let image = reader
         .decode()
         .map_err(|error| Error::Invalid(format!("invalid raster image: {error}")))?;
     for (name, actual) in [("width", image.width()), ("height", image.height())] {
