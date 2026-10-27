@@ -15,8 +15,8 @@ use deckr::state::{MemoryStateStore, StateStore};
 use futures_util::StreamExt;
 use tokio::time;
 
-const SERVICE_ID: &str = "openhab-home";
-const BACKUP_SERVICE_ID: &str = "openhab-backup";
+const SERVICE_ID: &str = "home";
+const BACKUP_SERVICE_ID: &str = "home-backup";
 const SESSION_ID: &str = "service-session";
 
 #[tokio::test]
@@ -32,10 +32,10 @@ async fn service_descriptor_parsing_validates_protocol_identity() {
 
     assert_eq!(descriptor.service_id, SERVICE_ID);
     assert_eq!(descriptor.endpoint.as_str(), service_address(SERVICE_ID));
-    assert!(descriptor.supported_operations.contains("sendCommand"));
+    assert!(descriptor.supported_operations.contains("writeProperty"));
     assert_eq!(
-        descriptor.views["items"].key_prefix,
-        service_view_prefix(SERVICE_ID, "items")
+        descriptor.views["resources"].key_prefix,
+        service_view_prefix(SERVICE_ID, "resources")
     );
 
     let mut wrong_protocol = protocol.clone();
@@ -54,12 +54,12 @@ async fn service_use_contract_omits_terms_and_keeps_access_policy_local() {
     let candidate = beacon.candidates(&protocol.feature_id).unwrap()[0].clone();
     let descriptor = parse_service_descriptor(&candidate, &protocol).unwrap();
     let client = EndpointAddress::parse("action_provider:test-provider").unwrap();
-    let terms = service_access(&descriptor, ["sendCommand"], BTreeMap::new()).unwrap();
+    let terms = service_access(&descriptor, ["writeProperty"], BTreeMap::new()).unwrap();
     let mut other_namespace = descriptor.clone();
     other_namespace.namespace = "dev.deckr.other.service".to_string();
-    let other_terms = service_access(&other_namespace, ["sendCommand"], BTreeMap::new()).unwrap();
+    let other_terms = service_access(&other_namespace, ["writeProperty"], BTreeMap::new()).unwrap();
 
-    assert_eq!(terms.service_namespace, "dev.deckr.openhab.service");
+    assert_eq!(terms.service_namespace, "dev.deckr.home_automation.service");
     assert_eq!(other_terms.service_namespace, "dev.deckr.other.service");
     assert_ne!(terms, other_terms);
     let spec = service_use_contract(&descriptor, &client, "client-session").unwrap();
@@ -134,8 +134,8 @@ async fn service_directory_indexes_and_removes_live_descriptors() {
 
     let query = ServiceQuery {
         service_id: Some(BACKUP_SERVICE_ID.to_string()),
-        operations: BTreeSet::from(["sendCommand".to_string()]),
-        views: BTreeSet::from(["items".to_string()]),
+        operations: BTreeSet::from(["writeProperty".to_string()]),
+        views: BTreeSet::from(["resources".to_string()]),
         endpoint: Some(EndpointAddress::parse(service_address(BACKUP_SERVICE_ID)).unwrap()),
         session_id: Some("backup-session".to_string()),
         ..ServiceQuery::default()
@@ -144,8 +144,8 @@ async fn service_directory_indexes_and_removes_live_descriptors() {
     let descriptor = resolver.resolve(&query).unwrap();
     assert_eq!(descriptor.service_id, BACKUP_SERVICE_ID);
     assert_eq!(
-        descriptor.views["items"].key_prefix,
-        service_view_prefix(BACKUP_SERVICE_ID, "items")
+        descriptor.views["resources"].key_prefix,
+        service_view_prefix(BACKUP_SERVICE_ID, "resources")
     );
 
     state
@@ -205,15 +205,20 @@ async fn service_directory_replays_current_watch_descriptors() {
 fn service_protocol(_service_id: &str) -> ServiceProtocol {
     let mut views = BTreeMap::new();
     views.insert(
-        "items".to_string(),
-        ServiceViewFamilyDefinition::new("deckr_openhab_service_view_v1").unwrap(),
+        "resources".to_string(),
+        ServiceViewFamilyDefinition::new("deckr_home_automation_service_view_v1").unwrap(),
     );
     ServiceProtocol::new(
-        "dev.deckr.openhab.service",
-        "dev.deckr.openhab.service",
-        "dev.deckr.openhab.service.advertisement.v1",
-        "dev.deckr.openhab.service_use.v1",
-        ["setItemScope", "sendCommand"],
+        "dev.deckr.home_automation.service",
+        "dev.deckr.home_automation.service",
+        "dev.deckr.home_automation.service.advertisement.v1",
+        "dev.deckr.home_automation.service_use.v1",
+        [
+            "listResources",
+            "setResourceScope",
+            "writeProperty",
+            "invokeAction",
+        ],
         views,
     )
     .unwrap()
